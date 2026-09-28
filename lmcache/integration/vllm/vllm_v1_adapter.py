@@ -61,25 +61,57 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# [热身笔记] 本文件数据结构词汇表:
+#   LoadSpec  = token三段图的数据化: vllm_cached_tokens|lmcache_cached_tokens(=N)|can_load
+#   SaveSpec  = 存储优化: skip_leading_tokens(跳过已存的)|can_save
+#   DisaggSpec= PD分离网络地址(高级, 暂跳过)
+#   RequestTracker = 长期记事本(贯穿所有step的累积状态)
+#   ReqMeta   = 单步搬运指令(由tracker.from_request_tracker派生, 含load/save_spec+slot_mapping)
+#   slot_mapping = 每个token的KV在GPU paged buffer的物理槽位号(load/save定位用)
+#   关键: LMCache提议(有多少缓存), vLLM调度器拍板(can_load/can_save)
 
+# [笔记] 逐层流水线(仅 use_layerwise=True;普通模式save全在wait_for_save一次性做)
+# 基本流程:
+#   start_load_kv(发起取所有层)
+#   → 逐层forward: 算layer_i前 wait_for_layer_load(layer_i) 确认该层取到 → 算该层 → save_kv_layer(layer_i)
+#   → ... 所有层算完 ...
+#   → wait_for_save(收尾) → 之后 get_finished(确认落地→释放block)
+#
+# start_load_kv:        发起把所有层KV从后端/CPU取进GPU(异步)
+# wait_for_layer_load:  【每层一次】算某层前,同步确认那层已取到GPU(next生成器)
+# save_kv_layer:        【每层一次】搬当前层 GPU→CPU(同步等) + 发起上一层 CPU→后端(异步不等)
+#                       ★交错一位:GPU→CPU 永远领先 CPU→后端 一层
+# wait_for_save:        补最后一脚next→确保所有层GPU→CPU完成(GPU buffer可覆盖)★主职责;
+#                       顺带发起最后一层CPU→后端(异步,不等落地)
+# get_finished:         基本直接释放，但是PD分离发送到远程就不一定了，因为需要GPU发射
+#
+# 两粒度"存完": GPU→CPU完成(wait_for_save,解放显存) vs CPU→后端落地(get_finished,释放block)
+
+
+# 加载规格
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
+    # vLLM 自己缓存的token数量
     vllm_cached_tokens: int
     # Number of tokens that are cached in LMCache
+    # LMCache 里缓存的token数
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
+    # 调度器是否允许我们加载
     can_load: bool
 
 
 @dataclass
 class SaveSpec:
     # Skip already saved tokens
+    # 跳过开头已经保存过的 token 数
     skip_leading_tokens: int
     # Whether the scheduler allow us to save the tokens
+    # 调度器是否允许保存
     can_save: bool
 
-
+# PD分离规格，暂时不看，回头再看
 @dataclass
 class DisaggSpec:
     req_id: str
@@ -99,23 +131,27 @@ tmp_disagg_tracker: dict[str, DisaggSpec] = {}
 def extract_request_configs(sampling_params: SamplingParams) -> Optional[dict]:
     return extract_request_configs_from_sampling_params(sampling_params)
 
-
+# 请求追踪器 维护一个request的当前状态
 @dataclass
 class RequestTracker:
     # Request id
+    # 请求 ID
     req_id: str
-
     # Total prompt token length
+    # Prompt总长度
     prompt_len: int
 
     # The token ids that has been scheduled so far
+    # 目前已调度的token
     token_ids: list[int]
 
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
+    # 已经分配的 block
     allocated_block_ids: list[int]
 
     # The number of tokens that has been saved
+    # 已经保存了多少 token ← 呼应 SaveSpec.skip_leading_tokens
     num_saved_tokens: int = 0
 
     # Disagg spec for the request
@@ -132,9 +168,11 @@ class RequestTracker:
     is_decode_phase = False
 
     # Whether the request cache should be saved
+    # 这个请求要不要存
     skip_save: bool = False
 
     # The number of tokens that are cached in LMCache for this request
+    # 这请求在 LMCache 里缓存了多少 ← 呼应 LoadSpec
     num_lmcache_cached_tokens: int = 0
 
     @_lmcache_nvtx_annotate
@@ -266,14 +304,19 @@ class RequestTracker:
         if len(new_token_ids) == 1:
             self.is_decode_phase = True
 
-
+# 请求元数据
+# 单步的搬运指令
 @dataclass
 class ReqMeta:
     # Request id
+    # 请求 ID
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
+    # 每个token的 kv 放到 哪个物理slot 上
+    # token:      [t0]  [t1]  [t2]  [t3] ...
+    # slot_mapping: 42    43    17    18  ...   ← 每个token的KV放在第几号slot
     slot_mapping: torch.Tensor
 
     # Whether is last prefill or not
@@ -769,7 +812,7 @@ class LMCacheConnectorV1Impl:
                 "use register_kv_caches to init kv_caches"
             )
             self._init_kv_caches_from_forward_context(forward_context)
-
+        # 准备:拿到 GPU KV 缓冲区 + 本步的搬运清单 meta
         metadata = self._parent._get_connector_metadata()
         assert isinstance(metadata, LMCacheConnectorMetadata)
 
@@ -792,7 +835,7 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
             last_idx = idx
-
+        # ② 遍历每张工单 ReqMeta,能搬的才搬
         for idx, request in enumerate(metadata.requests):
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
@@ -802,16 +845,18 @@ class LMCacheConnectorV1Impl:
                 self._stats_monitor.update_interval_prompt_tokens(
                     len(request.token_ids)
                 )
-
+            # 如果没有load_spec / 根本不能搬 直接continue
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
             tokens = request.token_ids
+            # 照着工单开始搬运：算出token范围 + 槽位，调 retrieve 把KV搬运过去
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.to(self.device)
             assert len(tokens) == len(slot_mapping)
-
+            # 哪些token需要搬运
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
+            # 把vLLM本地以及有的给mask掉，不进行搬运
             masked_token_count = (
                 request.load_spec.vllm_cached_tokens
                 // self._lmcache_chunk_size
@@ -820,13 +865,13 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
-            if self.use_layerwise:
+            if self.use_layerwise: # 流水线模式
                 if idx == last_idx:
                     sync = True
                 else:
                     sync = False
                 # NOTE(Jiayi): Perform blending before layerwise prefix caching
-                if self.enable_blending:
+                if self.enable_blending: # CacheBlend(RAG非前缀复用)
                     # TODO(Jiayi): Need to make prefix caching and blending compatible
                     self.blender.blend(
                         tokens[:lmcache_cached_tokens],
@@ -836,6 +881,7 @@ class LMCacheConnectorV1Impl:
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     )
                 else:
+                    # 调用 retrieve_layer 直接搬运过去 真正搬运
                     layerwise_retriever = self.lmcache_engine.retrieve_layer(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
@@ -845,10 +891,12 @@ class LMCacheConnectorV1Impl:
                         sync=sync,
                     )
                     # NOTE: retrieve for two layers at the first layer
+                    # 预取两层(流水线预热)
                     next(layerwise_retriever)
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
+                # 主线 ： 普通一次性retrieve
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
@@ -858,7 +906,7 @@ class LMCacheConnectorV1Impl:
                     request_configs=request.request_configs,
                     req_id=request.req_id,
                 )
-
+                # 检查是否搬运正确
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 num_expected_tokens = (
@@ -1007,16 +1055,16 @@ class LMCacheConnectorV1Impl:
             **kwargs: additional arguments for the save operation.
         """
         # Degraded mode (LMCache init failed): nothing to save, fall back silently.
-        if self.lmcache_engine is None:
+        if self.lmcache_engine is None: # 没启动 engine 直接pass
             return
 
-        if not self.use_layerwise:
+        if not self.use_layerwise: # 非逐层模式，直接pass
             return
 
-        if self.kv_role == "kv_consumer":
+        if self.kv_role == "kv_consumer": # 如果是纯消费者，不存
             # Don't do save if the role is kv_consumer
             return
-        if self._parent._connector_metadata is None:
+        if self._parent._connector_metadata is None: # 没有元数据，不存
             logger.warning(
                 "In connector.save_kv_layer, but the connector metadata is None"
             )
@@ -1033,7 +1081,7 @@ class LMCacheConnectorV1Impl:
             save_spec = request.save_spec
             if (
                 save_spec is None or not save_spec.can_save
-            ) and self.kv_role != "kv_producer":
+            ) and self.kv_role != "kv_producer": # 查看save_spec
                 continue
 
             layerwise_storer = self._layerwise_save_storers.get(request.req_id)
@@ -1061,8 +1109,8 @@ class LMCacheConnectorV1Impl:
                         skip_leading_tokens
                         // self._lmcache_chunk_size
                         * self._lmcache_chunk_size
-                    )
-
+                    ) # chunk 对齐
+                # 标记为False，然后不存
                 store_mask = torch.ones(len(token_ids), dtype=torch.bool)
                 store_mask[:skip_leading_tokens] = False
 
@@ -1077,6 +1125,8 @@ class LMCacheConnectorV1Impl:
 
                 # TODO (Jiayi): need to make layerwise storing
                 # compatible with disagg spec
+                # 调用LMcache_engine的store layer 结束
+                # 需要判断是否是第一次，如果是第一次的话需要创建一个生成器
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -1097,12 +1147,12 @@ class LMCacheConnectorV1Impl:
         """Blocking until the KV cache is saved to the connector buffer."""
 
         # Degraded mode (LMCache init failed): no engine to save to / unpin from.
-        if self.lmcache_engine is None:
+        if self.lmcache_engine is None: # pass
             return
 
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
-
+        # 如果是kv消费者
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             # But still need to unpin the kv caches according to req_id
@@ -1115,15 +1165,15 @@ class LMCacheConnectorV1Impl:
 
             return
 
-        if self.use_layerwise:
+        if self.use_layerwise: # 只有逐层模式才走这
             for request in connector_metadata.requests:
-                layerwise_storer = self._layerwise_save_storers.pop(
+                layerwise_storer = self._layerwise_save_storers.pop( # 如果这个请求确实有在存
                     request.req_id, None
                 )
                 if layerwise_storer is not None:
-                    next(layerwise_storer)
+                    next(layerwise_storer)# ★推最后一脚,让生成器跑完剩余部分★
                 # unpin the kv caches according to req_id
-                self.lmcache_engine.lookup_unpin(request.req_id)
+                self.lmcache_engine.lookup_unpin(request.req_id) # 解钉这个请求的缓存
             return
 
         assert len(self.kv_caches) > 0
@@ -1133,9 +1183,10 @@ class LMCacheConnectorV1Impl:
 
         # Probe decoder cache before store if bidirectional mode is enabled
         bidir_enabled = getattr(self.config, "pd_bidirectional", False)
-
+        # 一次性存 和 save_kv_layer逻辑一样
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
+            # 解除 pin 允许正常淘汰
             self.lmcache_engine.lookup_unpin(request.req_id)
 
             save_spec = request.save_spec
@@ -1347,7 +1398,7 @@ class LMCacheConnectorV1Impl:
     ###################
     # Scheduler side APIs
     ####################
-
+    # 这里只是说明：LM可以命中多少个，具体怎么调度还是要靠vLLM
     @_lmcache_nvtx_annotate
     def get_num_new_matched_tokens(
         self,
@@ -1369,6 +1420,18 @@ class LMCacheConnectorV1Impl:
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
+        # 忽略 DP attention 中 mock
+        # 进来一批请求
+        # ┌────┼────┐
+        # ▼    ▼    ▼
+        # GPU0  GPU1  GPU2    ← 3个DP副本(rank),各处理一部分
+        # 但是 DP attenton 在某些环节需要同步
+        #         某一步:
+        #   GPU0: 有 5 个请求要处理
+        #   GPU1: 有 3 个请求要处理
+        #   GPU2: 有 0 个请求!  ← 这一步刚好没请求分给它
+        #   所以GPU2就需要一个假请求
+        # 如果是mock的话，直接返回0就行了
         # to handle preempted requests, we want `get_num_new_matched_tokens` to be
         # idempotent under the condition that `update_state_after_alloc` is NOT called
         # then the two side-effects that must be idempotent are:
@@ -1388,7 +1451,8 @@ class LMCacheConnectorV1Impl:
         # crashing EngineCore during scheduling.
         if self.lookup_client is None:
             return 0
-
+        # 初始化失败，也返回0
+        # 如果之前查过了，就返回查询结果的缓存
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
         ) != -1:
@@ -1400,13 +1464,17 @@ class LMCacheConnectorV1Impl:
                 req_id,
             )
         else:
+            # 如果之前没查到过，第一次查
             logger.debug("Looking up cache for the first time for request %s!", req_id)
+            # 查一下优先级
             self._requests_priority[req_id] = getattr(request, "priority", 0)
 
             # token_ids = request.prompt_token_ids
             # all token ids covers the preemption case
+            # 拿到请求的所有token
             token_ids = request.all_token_ids
 
+            # 处理多模态 hash(图片等)
             # If the request has multimodal hashes, apply them to the token ids
             mm_hashes, mm_positions = extract_mm_features(request)
             if mm_hashes and mm_positions:
@@ -1416,15 +1484,16 @@ class LMCacheConnectorV1Impl:
                 token_ids = token_ids.tolist()
 
             request_configs = extract_request_configs(request.sampling_params)
-            if self.skip_last_n_tokens > 0:
+            if self.skip_last_n_tokens > 0: # 跳过最后N个
                 token_ids = token_ids[: -self.skip_last_n_tokens]
-
+            # 去里面查询lookup
+            # 看一下额外命中的个数
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
                 lookup_id=req_id,
                 request_configs=request_configs,
             )
-
+        # 如果异步查询还没出结果，返回None
         if num_external_hit_tokens is None:
             logger.debug(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
@@ -1439,15 +1508,19 @@ class LMCacheConnectorV1Impl:
         # blocks are cached, we need to recompute the last token.
         # This will be removed in the future if vLLM's scheduler provides
         # a better support for this case.
+        # LMCache命中的总数 - vLLM已经有的
         need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
         # In, full-prompt-hit case, we need to recompute the last token
+        # 如果全部命中还需要 - 1，因为第一次总要prefill，所以留下一个token
         if num_external_hit_tokens == request.num_tokens:
             need_to_allocate -= 1
 
         # Check if hit tokens meet the minimum for retrieve
         # If below minimum, skip retrieve but still record hit tokens
         # for skip_leading_tokens to avoid re-storing existing chunks
+        # 如果能加载的量太少就不值得加载
+        # 因为CPU/远程搬运都有开销，就不知道
         min_retrieve = self.config.min_retrieve_tokens
         below_min_retrieve = min_retrieve > 0 and need_to_allocate < min_retrieve
 
@@ -1479,6 +1552,8 @@ class LMCacheConnectorV1Impl:
         # when many concurrent requests each need large allocations.
         # Remaining tokens beyond the cap will be computed locally
         # via chunked prefill rather than loaded from external cache.
+        # 如果一次加载太多了，就需要限制最大值
+        # 高并发的时候，如果每个请求都需要加载大量KV，会耗尽GPU的 block 池，超过上限的部分，让他走chunked prefill
         capped_lmcache_tokens = num_external_hit_tokens
         if (
             self._max_tokens_per_load > 0
@@ -1508,7 +1583,7 @@ class LMCacheConnectorV1Impl:
                 need_to_allocate,
                 self._max_tokens_per_load,
             )
-
+        # 记账，记到LoadSpec中
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=capped_lmcache_tokens,
@@ -1526,6 +1601,8 @@ class LMCacheConnectorV1Impl:
 
     @_lmcache_nvtx_annotate
     def update_state_after_alloc(self, request: "Request", num_external_tokens: int):
+        # request : 哪个请求
+        # num_extern_tokens : vLLM发送的回执，get_num_new_matched_tokens 表示需要这么多但是实际分配了多少
         """
         Update KVConnector state after temporary buffer alloc.
 
@@ -1535,13 +1612,15 @@ class LMCacheConnectorV1Impl:
 
         # Degraded mode (LMCache init failed): there is no lookup client to clear
         # and no load spec was recorded, so nothing to do.
+        # 初始化失败 -> 直接返回
         if self.lookup_client is None:
             return
 
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
+        # 清理查询状态，消除cache lookup
         self.lookup_client.clear_lookup_status(request.request_id)
-
+        # PD 分离部分额外处理，先省略
         kv_transfer_params = (
             request.kv_transfer_params
             if hasattr(request, "kv_transfer_params")
@@ -1566,16 +1645,16 @@ class LMCacheConnectorV1Impl:
 
             tmp_disagg_tracker[request.request_id] = disagg_spec
         self._unfinished_requests[request.request_id] = request
-
+        # 没登记过 LoadSpec 直接返回
         if request.request_id not in self.load_specs:
             # No KV tokens from external KV cache, return
             return
-
+        # 如果一个token都没批准，就直接can_load变成False就可以了
         if num_external_tokens == 0:
             # No need to load anything
             self.load_specs[request.request_id].can_load = False
             return
-
+        # 对账环节
         recalc_last = (
             1
             if (
@@ -1584,6 +1663,7 @@ class LMCacheConnectorV1Impl:
             )
             else 0
         )
+        # 如果我上一个函数get_num_new_matched_tokens 说可以X个，但是vLLM只申请了Y个，就代表对不上账，直接assert
         assert (
             num_external_tokens
             == self.load_specs[request.request_id].lmcache_cached_tokens
@@ -1599,7 +1679,7 @@ class LMCacheConnectorV1Impl:
             "(full lmcache hits subtracts last token to recalculate logits)"
             f" for request {request.request_id}"
         )
-
+        # 对上账，直接激活
         self.load_specs[request.request_id].can_load = True
 
     @_lmcache_nvtx_annotate
@@ -1622,10 +1702,11 @@ class LMCacheConnectorV1Impl:
             return LMCacheConnectorMetadata()
 
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
-
+        # 创建一个空的"本步搬运指令清单"
         meta = LMCacheConnectorMetadata()
-
+        # 【第1段】清理已完成的请求
         for finished_req_id in scheduler_output.finished_req_ids:
+            # 从账本删掉
             self._request_trackers.pop(finished_req_id, None)
             self._unfinished_requests.pop(finished_req_id, None)
 
@@ -1634,10 +1715,13 @@ class LMCacheConnectorV1Impl:
         # 2. preempted requests (once per recovery)
         # can_load will only be True if `update_state_after_alloc` has been called
         # which only happens when vLLM's KV manager has space to receive KV from LMCache
+        # 【第2段】处理"新请求"
         for request in scheduler_output.scheduled_new_reqs:
             # Ignore DP attention mock requests
+            # 忽略假请求
             if request.req_id.startswith("mock_req"):
                 continue
+            # 取出对应的账本
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = (
                 request.num_computed_tokens
@@ -1670,6 +1754,7 @@ class LMCacheConnectorV1Impl:
                 discard_partial_chunks=self._discard_partial_chunks,
                 save_decode_cache=self.config.save_decode_cache,
             )
+            # 塞进清单里面
             if req_meta is not None:
                 meta.add_request(req_meta)
 
@@ -1719,7 +1804,7 @@ class LMCacheConnectorV1Impl:
                 if req_meta is not None:
                     meta.add_request(req_meta)
             return meta
-
+        # 【第3段】处理"缓存请求"(已在运行、继续的,含decode/抢占恢复)
         for i, req_id in enumerate(cached_reqs.req_ids):
             request_tracker = self._request_trackers[req_id]
             num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -1822,7 +1907,7 @@ class LMCacheConnectorV1Impl:
             # token_ids correctly for chunk key computation
             all_token_ids = list(request.all_token_ids) if preempted else None
 
-            request_tracker.update(
+            request_tracker.update( # 更新账本
                 new_token_ids,
                 new_block_ids,
                 preempted=preempted,
@@ -1831,7 +1916,7 @@ class LMCacheConnectorV1Impl:
                 all_token_ids=all_token_ids,
             )
 
-            req_meta = ReqMeta.from_request_tracker(
+            req_meta = ReqMeta.from_request_tracker( # 造搬运的指令
                 request_tracker,
                 self._block_size,
                 self._lmcache_chunk_size,
@@ -1842,7 +1927,7 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
-        return meta
+        return meta # 交给worker
 
     @_lmcache_nvtx_annotate
     def request_finished(
