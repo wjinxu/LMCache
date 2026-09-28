@@ -60,16 +60,24 @@ def _normalize_hash_to_int(hash_value: Union[int, bytes]) -> int:
 # (start_index, end_index, cache_engine_key｜hash)
 ProcessTokensResult = Tuple[int, int, Union[CacheEngineKey, int]]
 
-
+# Tokens -> keys 的翻译器
+# 把一串 token_ids 切成若干 chunk，每个 chunk算出一个 CacheEngineKey
+# 为什么需要：因为需要判断这段Prompt之前是否存过，但是总不可能拿所有的token去对比，所以就先切成固定大小的chunk
+# 然后每个chunk算个key，拿key去后端查是否存在
 class TokenDatabase(metaclass=abc.ABCMeta):
     """TokenDatabase is used to convert input tokens into list of
     cache engine keys. There are multiple ways to implement this:
 
     - ChunkedTokenDatabase: It processes tokens into chunks and convert
     each chunk into a cache engine key using prefix hash.
+    
+    主流：按照固定的长度(chunk_size)切，用prefix hash(前缀哈希链)算key
 
     - SegmentTokenDatabase: It processes tokens into segments based on
     special separators and convert each segment into a cache engine key.
+
+    按分隔符切段，(用于 RAG 那种文档拼接场景) 暂时不管
+
     """
 
     @abc.abstractmethod
@@ -193,7 +201,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             except ValueError:
                 continue
         raise ValueError(f"Hash function '{hash_algorithm}' not found in {module_name}")
-
+    # 主入口 ： 产出(start, end, key) 三元组序列
     @abc.abstractmethod
     def process_tokens(
         self,
@@ -227,6 +235,11 @@ class TokenDatabase(metaclass=abc.ABCMeta):
             is the start index of the tokens for the key. The second element
             is the end index of the tokens for the key. The third element is
             the cache engine key (or hash) for the tokens.
+
+        # ① 前置:mask 的 F 区必须整 chunk 对齐,否则报错
+        # ② 分支A: 给了 tokens  → 自己切块+算前缀哈希
+        # ③ 分支B: 给了 hashes  → 直接用现成 hash(vLLM 传来的),不自己算
+        # ④ 都没给 → 报错
         """
 
         raise NotImplementedError
@@ -344,24 +357,25 @@ class ChunkedTokenDatabase(TokenDatabase):
         :return: a generator of chunks of tokens, each with
                 shape [chunk_size]
         """
+        # 决定最后不满的零头要不要
         save_unfull_chunk = (
             self.config.save_unfull_chunk if self.config is not None else True
         )
         end = (
             len(tokens)
-            if save_unfull_chunk
-            else (len(tokens) - len(tokens) % self.chunk_size)
+            if save_unfull_chunk # 存零头：切到最后
+            else (len(tokens) - len(tokens) % self.chunk_size) # 不存，砍零头
         )
         for i in range(0, end, self.chunk_size):
-            yield tokens[i : i + self.chunk_size]
+            yield tokens[i : i + self.chunk_size] # 每个chunk砍一刀
 
     def _prefix_hash(
         self,
         token_chunks: Iterable[Union[torch.Tensor, List[int]]],
     ) -> Iterable[int]:
-        prefix_hash = self._get_init_hash()
-        for token_chunk in token_chunks:
-            prefix_hash = self._hash_tokens(token_chunk, prefix_hash)
+        prefix_hash = self._get_init_hash() # 起点 = NONE_HASH(空前缀的种子)
+        for token_chunk in token_chunks: # 滚动: 新hash=hash(旧hash, 本块)
+            prefix_hash = self._hash_tokens(token_chunk, prefix_hash) # 吐出当前累积hash,它又是下一轮的前缀
             yield prefix_hash
 
     @_lmcache_nvtx_annotate
@@ -401,6 +415,41 @@ class ChunkedTokenDatabase(TokenDatabase):
         :raises: ValueError if the number of Falses in the mask is not a
             multiple of the chunk size.
         """
+
+        """处理 tokens/hashes,返回对应的 cache engine key。
+
+        :param tokens: 要处理的 token(可以是 torch.Tensor 或 List[int])。
+
+        :param hashes: 要处理的哈希值。如果提供了它,
+            就用它(而不是 tokens)来生成 cache engine key。
+            —— 即 vLLM 已经算好 hash 时,直接拿来用,省一遍计算
+
+        :param offsets: 每个 chunk 里的 token 数量。
+            —— 走 hashes 分支时必须提供,因为每块长度不固定,靠它推进边界
+
+        :param mask: token 的掩码。长度必须和 tokens 一致。
+            掩码的形状永远是 FFFFFTTTTTTT 这种:
+            True 表示这个 token 需要被匹配(处理),
+            而 False 永远位于张量的前缀部分(开头)。
+            —— F = 已算过的前缀(跳过产出),T = 要处理的部分
+
+        :param make_key: 是否生成 cache engine key。
+            如果为 False,则返回哈希值(而不是包装成 key)。
+
+        :param request_configs: 请求的配置。
+            —— 如 LoRA ID、多模态等,会进 CacheEngineKey 参与区分
+
+        :returns: 一个由三元组构成的可迭代对象。三元组里:
+            第一个元素是该 key 对应 token 的起始下标(start_idx);
+            第二个元素是该 key 对应 token 的结束下标(end_idx);
+            第三个元素是这些 token 的 cache engine key(或哈希值)。
+            —— 即 (start, end, key),每个 chunk 一条
+
+        :raises: 如果掩码里 False 的数量不是 chunk_size 的整数倍,
+            抛出 ValueError。
+            —— F 区必须整 chunk 对齐,不能跳过半个 chunk
+        """
+
         if mask is not None:
             num_falses = mask.numel() - mask.long().sum().item()
         else:
@@ -412,15 +461,18 @@ class ChunkedTokenDatabase(TokenDatabase):
             )
 
         if tokens is not None:
+            # 主流 ： 给 tokens
+            # 算出总token数量
             total_len = len(tokens)
-            token_chunks = self._chunk_tokens(tokens)
-            prefix_hashes = self._prefix_hash(token_chunks)
-            for chunk_id, hash_val in enumerate(prefix_hashes):
+            token_chunks = self._chunk_tokens(tokens) # 切块
+            prefix_hashes = self._prefix_hash(token_chunks) # 逐块滚动前缀哈希
+            for chunk_id, hash_val in enumerate(prefix_hashes): 
                 start_idx = chunk_id * self.chunk_size
                 end_idx = min(start_idx + self.chunk_size, total_len)
-                if start_idx < num_falses:
+                if start_idx < num_falses: # 这块落在 F 区域，跳过
                     continue
                 else:
+                    # 然后计算是不是只吐裸hash值
                     if make_key:
                         yield (
                             start_idx,
@@ -430,6 +482,7 @@ class ChunkedTokenDatabase(TokenDatabase):
                     else:
                         yield start_idx, end_idx, hash_val
         elif hashes is not None:
+            # 一样，就是vLLM已经自己计算了每个block的hash
             assert offsets is not None, (
                 "If hashes are provided, offsets must also be provided."
             )
@@ -448,7 +501,7 @@ class ChunkedTokenDatabase(TokenDatabase):
         else:
             raise ValueError("Either tokens or hashes must be provided.")
 
-
+# 按照特殊分隔符切段
 class SegmentTokenDatabase(TokenDatabase):
     """
     Currently, we still use special separators to identify chunks.
