@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#include <limits>
+#include <tuple>
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -186,6 +189,65 @@ PYBIND11_MODULE(cuda_ops, m) {
       py::arg("direction"), py::arg("device"), py::arg("host_buffer_alignment"),
       py::arg("kernel_group_specs"), py::arg("batch_steps"),
       py::arg("phase_timing_enabled") = false, py::arg("session_id") = "",
+      py::call_guard<py::gil_scoped_release>());
+  // Ordinary tuples avoid one Python/C++ round trip per descriptor. Fixed
+  // tuple arity and integer widths are checked by pybind before this runs.
+  using CopyTuple = std::tuple<uintptr_t, uintptr_t, size_t, size_t>;
+  using LaunchTuple = std::tuple<int, int64_t, int, int, int>;
+  using StepTuple =
+      std::tuple<std::vector<CopyTuple>, std::vector<LaunchTuple>>;
+  m.def(
+      "execute_object_group_transfer_tuples",
+      [](int direction, const torch::Device& device, size_t alignment,
+         const std::vector<KernelGroupSpec>& groups,
+         const std::vector<StepTuple>& plan, bool phase_timing_enabled,
+         const std::string& session_id) {
+        TORCH_CHECK(direction == 0 || direction == 1, "invalid direction");
+        TORCH_CHECK(device.is_cuda(), "expected a CUDA device");
+        TORCH_CHECK(alignment && !(alignment & (alignment - 1)),
+                    "host alignment must be a power of two");
+        std::vector<BatchStep> steps;
+        steps.reserve(plan.size());
+        // Validate the entire plan before enqueueing any copies or kernels.
+        for (const auto& [copies, launches] : plan) {
+          BatchStep step;
+          step.staging.reserve(copies.size());
+          step.launches.reserve(launches.size());
+          for (const auto& [dest, src, nbytes, offset] : copies) {
+            const auto max = std::numeric_limits<uintptr_t>::max();
+            TORCH_CHECK(dest && src && nbytes && nbytes <= max - dest &&
+                            nbytes <= max - src && nbytes <= max - offset,
+                        "invalid staging address or size");
+            step.staging.push_back({dest, src, nbytes, offset});
+          }
+          for (const auto& [group_idx, offset, blocks, objects, skip] :
+               launches) {
+            TORCH_CHECK(group_idx >= 0 &&
+                            static_cast<size_t>(group_idx) < groups.size(),
+                        "kernel group index out of range");
+            const auto& group = groups[group_idx];
+            TORCH_CHECK(offset >= 0 && offset <= group.block_ids_capacity &&
+                            blocks >= 0 &&
+                            blocks <= group.block_ids_capacity - offset,
+                        "block ID slice outside capacity");
+            TORCH_CHECK(objects >= 1 && objects <= 4 &&
+                            static_cast<size_t>(objects) <=
+                                group.lmcache_objects_ptrs.size() &&
+                            skip >= 0 && skip <= blocks,
+                        "invalid object count or prefix skip");
+            step.launches.push_back({group_idx, offset, blocks, objects, skip});
+          }
+          steps.push_back(std::move(step));
+        }
+        execute_object_group_transfer(static_cast<TransferDirection>(direction),
+                                      device, alignment, groups, steps,
+                                      phase_timing_enabled, session_id);
+      },
+      py::arg("direction"), py::arg("device"), py::arg("host_buffer_alignment"),
+      py::arg("kernel_group_specs"), py::arg("batch_steps"),
+      py::arg("phase_timing_enabled") = false, py::arg("session_id") = "",
+      "Submit [(copies, launches), ...] using four-integer copy tuples and "
+      "five-integer launch tuples; invalid plans raise before submission.",
       py::call_guard<py::gil_scoped_release>());
   m.def(
       "pop_completed_phase_timings",

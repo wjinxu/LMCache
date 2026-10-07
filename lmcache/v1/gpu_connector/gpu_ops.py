@@ -105,8 +105,10 @@ def build_staging_copies(
     memory_objs: Sequence[MemoryObj],
     gpu_buffers: Sequence[torch.Tensor],
     is_h2d: bool,
-) -> list[StagingCopy]:
-    """Build native ``StagingCopy`` descriptors for one batch of lazy objects.
+    *,
+    as_tuples: bool = False,
+) -> list[StagingCopy | tuple[int, int, int, int]]:
+    """Build staging descriptors for one batch of lazy objects.
 
     The H2D/D2H direction decides which side is source vs. destination; the host
     side is always the lazy memory object. Callers must ensure every object is
@@ -117,15 +119,17 @@ def build_staging_copies(
         gpu_buffers: GPU staging buffers, aligned element-wise with
             ``memory_objs``.
         is_h2d: True for retrieve (CPU->GPU), False for store (GPU->CPU).
+        as_tuples: Emit plain (destination, source, bytes, host_offset) tuples
+            for bulk native conversion instead of individual pybind objects.
 
     Returns:
-        One ``device_ops.StagingCopy`` per object, in input order.
+        One descriptor or four-integer tuple per object, in input order.
 
     Raises:
         ValueError: If an object has not been allocated (``raw_tensor`` is None)
             or its size does not match its GPU buffer.
     """
-    copies: list[StagingCopy] = []
+    copies: list[StagingCopy | tuple[int, int, int, int]] = []
     for memory_obj, gpu_buffer in zip(memory_objs, gpu_buffers, strict=True):
         if memory_obj.raw_tensor is None:
             raise ValueError(
@@ -141,12 +145,7 @@ def build_staging_copies(
         host_ptr = memory_obj.data_ptr
         gpu_ptr = gpu_buffer.data_ptr()
         host_offset = memory_obj.meta.address
-        if is_h2d:
-            copies.append(
-                device_ops.StagingCopy(gpu_ptr, host_ptr, mem_obj_size, host_offset)
-            )
-        else:
-            copies.append(
-                device_ops.StagingCopy(host_ptr, gpu_ptr, mem_obj_size, host_offset)
-            )
+        dest, src = (gpu_ptr, host_ptr) if is_h2d else (host_ptr, gpu_ptr)
+        args = (dest, src, mem_obj_size, host_offset)
+        copies.append(args if as_tuples else device_ops.StagingCopy(*args))
     return copies
