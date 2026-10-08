@@ -174,27 +174,20 @@ PYBIND11_MODULE(cuda_ops, m) {
            }),
            py::arg("staging"), py::arg("launches"))
       .def_static(
-          "from_tuples",
+          "from_staging_tuples",
           [](const std::vector<
                  std::tuple<uintptr_t, uintptr_t, size_t, size_t>>& staging,
-             const std::vector<std::tuple<int, int64_t, int, int, int>>&
-                 launches) {
-            BatchStep step;
+             std::vector<LaunchVar> launches) {
+            BatchStep step{{}, std::move(launches)};
             step.staging.reserve(staging.size());
-            step.launches.reserve(launches.size());
             for (const auto& [dest, src, nbytes, offset] : staging) {
               step.staging.push_back({dest, src, nbytes, offset});
-            }
-            for (const auto& [group, offset, blocks, objects, skip] :
-                 launches) {
-              step.launches.push_back({group, offset, blocks, objects, skip});
             }
             return step;
           },
           py::arg("staging"), py::arg("launches"),
-          "Build one batch from (dest, src, bytes, host_offset) copy tuples "
-          "and (group, block_offset, blocks, objects, skip) launch tuples. "
-          "Invalid tuple arity or integer widths raise TypeError.");
+          "Build a batch from (dest, src, bytes, host_offset) staging tuples "
+          "and LaunchVar descriptors. Invalid staging tuples raise TypeError.");
   m.def(
       "execute_object_group_transfer",
       [](int direction, const torch::Device& device,

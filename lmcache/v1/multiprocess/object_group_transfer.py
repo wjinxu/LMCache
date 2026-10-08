@@ -310,9 +310,10 @@ def _run_object_group_transfer_plan(
     kernel_group_ids = object_group.kernel_group_indices
     is_h2d = direction == lmcache_native.TransferDirection.H2D
     max_batch_size = cache_context.max_batch_size
-    make_batch = getattr(device_ops.BatchStep, "from_tuples", device_ops.BatchStep)
-    use_tuples = make_batch is not device_ops.BatchStep
-    make_launch = (lambda *args: args) if use_tuples else device_ops.LaunchVar
+    use_staging_tuples = hasattr(device_ops.BatchStep, "from_staging_tuples")
+    make_batch = getattr(
+        device_ops.BatchStep, "from_staging_tuples", device_ops.BatchStep
+    )
 
     # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
     kernel_group_specs: list[Any] = []
@@ -400,7 +401,7 @@ def _run_object_group_transfer_plan(
             memory_object_batch,
             object_group_buffers[:batch_len],
             is_h2d,
-            as_tuples=use_tuples,
+            as_tuples=use_staging_tuples,
         )
 
         launches: list[Any] = []
@@ -421,7 +422,7 @@ def _run_object_group_transfer_plan(
             )
 
             launches.append(
-                make_launch(
+                device_ops.LaunchVar(
                     spec_index_by_kg[kernel_group_id],
                     start_block_pos,
                     end_block_pos - start_block_pos,

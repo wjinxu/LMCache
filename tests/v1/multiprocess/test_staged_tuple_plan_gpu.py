@@ -26,8 +26,9 @@ pytestmark = [
     pytest.mark.cuda,
     pytest.mark.no_shared_allocator,
     pytest.mark.skipif(
-        torch_device_type != "cuda" or not hasattr(device_ops.BatchStep, "from_tuples"),
-        reason="Requires the CUDA tuple-plan executor",
+        torch_device_type != "cuda"
+        or not hasattr(device_ops.BatchStep, "from_staging_tuples"),
+        reason="Requires the CUDA staging-tuple batch factory",
     ),
 ]
 
@@ -111,7 +112,7 @@ def test_tuple_plan_matches_legacy(
                 obj.raw_tensor.copy_(original)
             with monkeypatch.context() as patch:
                 if legacy:
-                    patch.delattr(device_ops.BatchStep, "from_tuples")
+                    patch.delattr(device_ops.BatchStep, "from_staging_tuples")
                 with torch.cuda.stream(ctx.stream):
                     # D2H leaves skipped prefix bytes in reused staging slots.
                     for slot in range(ctx.max_batch_size):
@@ -154,17 +155,12 @@ def test_tuple_plan_matches_legacy(
 
 
 @pytest.mark.parametrize(
-    "copies,launches",
-    [
-        ([(1, 1, 8)], []),
-        ([(1, 1, -1, 0)], []),
-        ([], [(0, 0, 1, 1)]),
-        ([], [(0, 0, 1 << 40, 1, 0)]),
-    ],
+    "copies",
+    [[(1, 1, 8)], [(1, 1, -1, 0)], [(1, 1, 8, 1 << 80)]],
 )
-def test_malformed_batch_rejected(copies: list, launches: list) -> None:
+def test_malformed_batch_rejected(copies: list[tuple[int, ...]]) -> None:
     """Fixed tuple arity and C++ integer widths are checked at construction."""
-    factory = getattr(device_ops.BatchStep, "from_tuples", None)
+    factory = getattr(device_ops.BatchStep, "from_staging_tuples", None)
     assert factory is not None
     with pytest.raises(TypeError):
-        factory(copies, launches)
+        factory(copies, [])
