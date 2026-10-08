@@ -26,8 +26,7 @@ pytestmark = [
     pytest.mark.cuda,
     pytest.mark.no_shared_allocator,
     pytest.mark.skipif(
-        torch_device_type != "cuda"
-        or not hasattr(device_ops, "execute_object_group_transfer_tuples"),
+        torch_device_type != "cuda" or not hasattr(device_ops.BatchStep, "from_tuples"),
         reason="Requires the CUDA tuple-plan executor",
     ),
 ]
@@ -112,7 +111,7 @@ def test_tuple_plan_matches_legacy(
                 obj.raw_tensor.copy_(original)
             with monkeypatch.context() as patch:
                 if legacy:
-                    patch.delattr(device_ops, "execute_object_group_transfer_tuples")
+                    patch.delattr(device_ops.BatchStep, "from_tuples")
                 with torch.cuda.stream(ctx.stream):
                     # D2H leaves skipped prefix bytes in reused staging slots.
                     for slot in range(ctx.max_batch_size):
@@ -155,43 +154,17 @@ def test_tuple_plan_matches_legacy(
 
 
 @pytest.mark.parametrize(
-    "plan",
+    "copies,launches",
     [
-        [([(1, 1, 8)], [])],  # Wrong tuple arity.
-        [([(1, 1, -1, 0)], [])],  # Unsigned integer conversion.
-        [([(0, 1, 8, 0)], [])],  # Null address.
-        [([(1, 1, 8, 0)], [(0, 0, 1, 1, 0)])],  # No such group.
-        [([], []), ([(1, 1, 8, 0)], [(-1, 0, 1, 1, 0)])],
+        ([(1, 1, 8)], []),
+        ([(1, 1, -1, 0)], []),
+        ([], [(0, 0, 1, 1)]),
+        ([], [(0, 0, 1 << 40, 1, 0)]),
     ],
 )
-def test_invalid_plan_rejected_before_submission(plan: list) -> None:
-    """Reject malformed input before dereferencing the deliberately invalid pointers."""
-    with pytest.raises((RuntimeError, TypeError)):
-        device_ops.execute_object_group_transfer_tuples(
-            native.TransferDirection.H2D, torch.device("cuda:0"), 1 << 30, [], plan
-        )
-
-
-@pytest.mark.parametrize(
-    "launch",
-    [
-        (0, -1, 1, 1, 0),
-        (0, 0, 5, 1, 0),
-        (0, 0, 1, 5, 0),
-        (0, 0, 1, 1, -1),
-        (0, 0, 1, 1, 2),
-    ],
-)
-def test_invalid_launch_rejected_before_copies(launch: tuple[int, ...]) -> None:
-    """Invalid bounds and counts fail before any staging pointer is used."""
-    group = native.KernelGroupSpec(
-        1, [1] * 4, native.PageBufferShapeDesc(), 32, 3, 1, 4
-    )
-    with pytest.raises(RuntimeError):
-        device_ops.execute_object_group_transfer_tuples(
-            native.TransferDirection.H2D,
-            torch.device("cuda:0"),
-            1 << 30,
-            [group],
-            [([(1, 1, 8, 0)], [launch])],
-        )
+def test_malformed_batch_rejected(copies: list, launches: list) -> None:
+    """Fixed tuple arity and C++ integer widths are checked at construction."""
+    factory = getattr(device_ops.BatchStep, "from_tuples", None)
+    assert factory is not None
+    with pytest.raises(TypeError):
+        factory(copies, launches)

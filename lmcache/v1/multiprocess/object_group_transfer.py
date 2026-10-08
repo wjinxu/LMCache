@@ -310,7 +310,9 @@ def _run_object_group_transfer_plan(
     kernel_group_ids = object_group.kernel_group_indices
     is_h2d = direction == lmcache_native.TransferDirection.H2D
     max_batch_size = cache_context.max_batch_size
-    use_tuples = hasattr(device_ops, "execute_object_group_transfer_tuples")
+    make_batch = getattr(device_ops.BatchStep, "from_tuples", device_ops.BatchStep)
+    use_tuples = make_batch is not device_ops.BatchStep
+    make_launch = (lambda *args: args) if use_tuples else device_ops.LaunchVar
 
     # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
     kernel_group_specs: list[Any] = []
@@ -418,22 +420,17 @@ def _run_object_group_transfer_plan(
                 orig_skip_blocks,
             )
 
-            launch_args = (
-                spec_index_by_kg[kernel_group_id],
-                start_block_pos,
-                end_block_pos - start_block_pos,
-                batch_len,
-                recalculated_skip_blocks,
-            )
             launches.append(
-                launch_args if use_tuples else device_ops.LaunchVar(*launch_args)
+                make_launch(
+                    spec_index_by_kg[kernel_group_id],
+                    start_block_pos,
+                    end_block_pos - start_block_pos,
+                    batch_len,
+                    recalculated_skip_blocks,
+                )
             )
 
-        batch_steps.append(
-            (staging, launches)
-            if use_tuples
-            else device_ops.BatchStep(staging, launches)
-        )
+        batch_steps.append(make_batch(staging, launches))
 
     if not batch_steps:
         return
@@ -451,12 +448,7 @@ def _run_object_group_transfer_plan(
         if _HAS_TRANSFER_PHASE_TIMING
         else {}
     )
-    execute = (
-        device_ops.execute_object_group_transfer_tuples
-        if use_tuples
-        else device_ops.execute_object_group_transfer
-    )
-    execute(
+    device_ops.execute_object_group_transfer(
         direction,
         cache_context.device,
         LazyMemoryAllocator.PIN_CHUNK_SIZE,
