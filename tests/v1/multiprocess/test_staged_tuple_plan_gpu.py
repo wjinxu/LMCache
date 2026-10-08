@@ -27,8 +27,8 @@ pytestmark = [
     pytest.mark.no_shared_allocator,
     pytest.mark.skipif(
         torch_device_type != "cuda"
-        or not hasattr(device_ops.BatchStep, "from_staging_tuples"),
-        reason="Requires the CUDA staging-tuple batch factory",
+        or not hasattr(device_ops, "execute_object_group_transfer_tuples"),
+        reason="Requires the CUDA complete tuple-plan executor",
     ),
 ]
 
@@ -112,7 +112,7 @@ def test_tuple_plan_matches_legacy(
                 obj.raw_tensor.copy_(original)
             with monkeypatch.context() as patch:
                 if legacy:
-                    patch.delattr(device_ops.BatchStep, "from_staging_tuples")
+                    patch.delattr(device_ops, "execute_object_group_transfer_tuples")
                 with torch.cuda.stream(ctx.stream):
                     # D2H leaves skipped prefix bytes in reused staging slots.
                     for slot in range(ctx.max_batch_size):
@@ -155,12 +155,24 @@ def test_tuple_plan_matches_legacy(
 
 
 @pytest.mark.parametrize(
-    "copies",
-    [[(1, 1, 8)], [(1, 1, -1, 0)], [(1, 1, 8, 1 << 80)]],
+    "batches",
+    [
+        ([(1, 1, 8)], []),
+        ([(1, 1, -1, 0)], []),
+        ([(1, 1, 8, 1 << 80)], []),
+        ([], [(0, 0, 4, 1)]),
+        ([], [(1 << 80, 0, 4, 1, 0)]),
+    ],
 )
-def test_malformed_batch_rejected(copies: list[tuple[int, ...]]) -> None:
-    """Fixed tuple arity and C++ integer widths are checked at construction."""
-    factory = getattr(device_ops.BatchStep, "from_staging_tuples", None)
-    assert factory is not None
+def test_malformed_plan_rejected(
+    batches: tuple[list[tuple[int, ...]], list[tuple[int, ...]]],
+) -> None:
+    """Tuple arity and C++ integer widths are checked before submission."""
     with pytest.raises(TypeError):
-        factory(copies, [])
+        device_ops.execute_object_group_transfer_tuples(
+            native.TransferDirection.H2D,
+            torch.device("cuda:0"),
+            LazyMemoryAllocator.PIN_CHUNK_SIZE,
+            [],
+            [batches],
+        )

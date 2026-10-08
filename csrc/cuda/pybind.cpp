@@ -172,22 +172,7 @@ PYBIND11_MODULE(cuda_ops, m) {
                        std::vector<LaunchVar> launches) {
              return BatchStep{std::move(staging), std::move(launches)};
            }),
-           py::arg("staging"), py::arg("launches"))
-      .def_static(
-          "from_staging_tuples",
-          [](const std::vector<
-                 std::tuple<uintptr_t, uintptr_t, size_t, size_t>>& staging,
-             std::vector<LaunchVar> launches) {
-            BatchStep step{{}, std::move(launches)};
-            step.staging.reserve(staging.size());
-            for (const auto& [dest, src, nbytes, offset] : staging) {
-              step.staging.push_back({dest, src, nbytes, offset});
-            }
-            return step;
-          },
-          py::arg("staging"), py::arg("launches"),
-          "Build a batch from (dest, src, bytes, host_offset) staging tuples "
-          "and LaunchVar descriptors. Invalid staging tuples raise TypeError.");
+           py::arg("staging"), py::arg("launches"));
   m.def(
       "execute_object_group_transfer",
       [](int direction, const torch::Device& device,
@@ -203,6 +188,43 @@ PYBIND11_MODULE(cuda_ops, m) {
       py::arg("direction"), py::arg("device"), py::arg("host_buffer_alignment"),
       py::arg("kernel_group_specs"), py::arg("batch_steps"),
       py::arg("phase_timing_enabled") = false, py::arg("session_id") = "",
+      py::call_guard<py::gil_scoped_release>());
+  // Preserve batch boundaries while converting the complete plan once.
+  using CopyTuple = std::tuple<uintptr_t, uintptr_t, size_t, size_t>;
+  using LaunchTuple = std::tuple<int, int64_t, int, int, int>;
+  using BatchTuple =
+      std::tuple<std::vector<CopyTuple>, std::vector<LaunchTuple>>;
+  m.def(
+      "execute_object_group_transfer_tuples",
+      [](int direction, const torch::Device& device, size_t alignment,
+         const std::vector<KernelGroupSpec>& groups,
+         const std::vector<BatchTuple>& batches, bool phase_timing_enabled,
+         const std::string& session_id) {
+        std::vector<BatchStep> steps;
+        steps.reserve(batches.size());
+        for (const auto& [copies, launches] : batches) {
+          BatchStep step;
+          step.staging.reserve(copies.size());
+          step.launches.reserve(launches.size());
+          for (const auto& [dest, src, nbytes, host_offset] : copies) {
+            step.staging.push_back({dest, src, nbytes, host_offset});
+          }
+          for (const auto& [group, offset, blocks, objects, skip] : launches) {
+            step.launches.push_back({group, offset, blocks, objects, skip});
+          }
+          steps.push_back(std::move(step));
+        }
+        execute_object_group_transfer(static_cast<TransferDirection>(direction),
+                                      device, alignment, groups, steps,
+                                      phase_timing_enabled, session_id);
+      },
+      py::arg("direction"), py::arg("device"), py::arg("host_buffer_alignment"),
+      py::arg("kernel_group_specs"), py::arg("batch_steps"),
+      py::arg("phase_timing_enabled") = false, py::arg("session_id") = "",
+      "Submit [(copies, launches), ...] with (dest, src, bytes, host_offset) "
+      "copy tuples and (group, block_offset, blocks, objects, skip) launch "
+      "tuples. Invalid tuple arity or integer widths raise TypeError; "
+      "transfer validation and ordering follow the descriptor executor.",
       py::call_guard<py::gil_scoped_release>());
   m.def(
       "pop_completed_phase_timings",

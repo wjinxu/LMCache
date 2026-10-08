@@ -166,6 +166,7 @@ def downsample_and_stage_block_ids(
 
     This mainly targets the case where a portion of the blocks are not
     needed for every chunk, such as deepseek v4's swa cache.
+    Groups retaining every block use a single list copy.
 
     Note that the we do NOT do any object-level skipping here.
 
@@ -222,6 +223,10 @@ def downsample_and_stage_block_ids(
             f"of total_blocks_per_chunk ({total_blocks_per_chunk}), but got "
             f"{len(old_block_ids)}"
         )
+
+        if keep_blocks_per_chunk == total_blocks_per_chunk:
+            block_ids[kernel_group_id] = old_block_ids.copy()
+            continue
 
         for i in range(0, len(old_block_ids), total_blocks_per_chunk):
             chunk_block_ids = old_block_ids[i : i + total_blocks_per_chunk]
@@ -281,8 +286,9 @@ def _run_object_group_transfer_plan(
     same batched-iteration / skip logic, but instead of issuing each staging
     copy and kernel launch immediately (each a GIL release/re-acquire), it
     resolves every argument to plain pointers/scalars (the "planner", GIL held
-    throughout) and hands the whole plan to ``execute_object_group_transfer``,
-    which issues all of it on the stream within a single GIL release.
+    throughout). Copy/launch tuples are converted together by
+    ``execute_object_group_transfer_tuples``; older extensions receive the
+    original descriptors. Both paths use the same ordered CUDA executor.
 
     Requires every object to be non-GDS (staged through the lazy-allocator
     path); the caller skips groups that contain any GDS-backed object.
@@ -310,10 +316,7 @@ def _run_object_group_transfer_plan(
     kernel_group_ids = object_group.kernel_group_indices
     is_h2d = direction == lmcache_native.TransferDirection.H2D
     max_batch_size = cache_context.max_batch_size
-    use_staging_tuples = hasattr(device_ops.BatchStep, "from_staging_tuples")
-    make_batch = getattr(
-        device_ops.BatchStep, "from_staging_tuples", device_ops.BatchStep
-    )
+    use_tuples = hasattr(device_ops, "execute_object_group_transfer_tuples")
 
     # --- Per-kernel-group invariants, resolved once (vs. every batch before) ---
     kernel_group_specs: list[Any] = []
@@ -359,6 +362,9 @@ def _run_object_group_transfer_plan(
         cache_context.get_temp_object_group_buffer(slot, object_group_id)
         for slot in range(max_batch_size)
     ]
+    object_group_slots = [
+        (buffer.data_ptr(), buffer.nbytes) for buffer in object_group_buffers
+    ]
 
     attn_desc = kv_groups_manager.get_attn_desc()
     num_objects_to_skip = 0
@@ -373,7 +379,9 @@ def _run_object_group_transfer_plan(
         )
 
     # --- Walk the batches in order, emitting staging + launch work per step ---
-    batch_steps: list[Any] = []
+    batch_steps: list[
+        tuple[list[tuple[int, int, int, int]], list[tuple[int, int, int, int, int]]]
+    ] = []
     for start_object_idx, memory_object_batch in batched_iteration_with_skip(
         memory_objs, batch_size, skip_count=num_objects_to_skip
     ):
@@ -399,12 +407,11 @@ def _run_object_group_transfer_plan(
 
         staging = build_staging_copies(
             memory_object_batch,
-            object_group_buffers[:batch_len],
+            object_group_slots[:batch_len],
             is_h2d,
-            as_tuples=use_staging_tuples,
         )
 
-        launches: list[Any] = []
+        launches: list[tuple[int, int, int, int, int]] = []
         for kernel_group_id in kernel_group_ids:
             blocks_per_chunk = blocks_per_chunk_by_kg[kernel_group_id]
             blocks_per_window = blocks_per_window_by_kg[kernel_group_id]
@@ -412,8 +419,12 @@ def _run_object_group_transfer_plan(
             start_block_pos = start_object_idx * blocks_per_window
             end_block_pos = (start_object_idx + batch_len) * blocks_per_window
 
-            orig_skip_blocks = cache_context.calculate_num_blocks(
-                skip_tokens_in_chunk, kernel_group_id
+            orig_skip_blocks = (
+                cache_context.calculate_num_blocks(
+                    skip_tokens_in_chunk, kernel_group_id
+                )
+                if skip_tokens_in_chunk
+                else 0
             )
             recalculated_skip_blocks = recalculate_blocks_to_skip(
                 blocks_per_chunk,
@@ -422,7 +433,7 @@ def _run_object_group_transfer_plan(
             )
 
             launches.append(
-                device_ops.LaunchVar(
+                (
                     spec_index_by_kg[kernel_group_id],
                     start_block_pos,
                     end_block_pos - start_block_pos,
@@ -431,7 +442,7 @@ def _run_object_group_transfer_plan(
                 )
             )
 
-        batch_steps.append(make_batch(staging, launches))
+        batch_steps.append((staging, launches))
 
     if not batch_steps:
         return
@@ -449,12 +460,26 @@ def _run_object_group_transfer_plan(
         if _HAS_TRANSFER_PHASE_TIMING
         else {}
     )
-    device_ops.execute_object_group_transfer(
+    execute = getattr(
+        device_ops,
+        "execute_object_group_transfer_tuples",
+        device_ops.execute_object_group_transfer,
+    )
+    native_steps: Sequence[object] = batch_steps
+    if not use_tuples:
+        native_steps = [
+            device_ops.BatchStep(
+                [device_ops.StagingCopy(*copy) for copy in copies],
+                [device_ops.LaunchVar(*launch) for launch in launches],
+            )
+            for copies, launches in batch_steps
+        ]
+    execute(
         direction,
         cache_context.device,
         LazyMemoryAllocator.PIN_CHUNK_SIZE,
         kernel_group_specs,
-        batch_steps,
+        native_steps,
         **timing_kwargs,
     )
 

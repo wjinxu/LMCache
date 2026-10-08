@@ -10,7 +10,6 @@ from lmcache import device_ops
 from lmcache.v1.gpu_connector.gds_context import SlabDirection, get_l1_gds_context
 from lmcache.v1.memory_allocators.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import GDSMemoryObject, MemoryObj
-from lmcache.v1.platform.ops_types import StagingCopy
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -103,12 +102,10 @@ def lmcache_memcpy_async_d2h(
 
 def build_staging_copies(
     memory_objs: Sequence[MemoryObj],
-    gpu_buffers: Sequence[torch.Tensor],
+    gpu_slots: Sequence[tuple[int, int]],
     is_h2d: bool,
-    *,
-    as_tuples: bool = False,
-) -> list[StagingCopy | tuple[int, int, int, int]]:
-    """Build staging descriptors for one batch of lazy objects.
+) -> list[tuple[int, int, int, int]]:
+    """Build staging-copy tuples for one batch of lazy objects.
 
     The H2D/D2H direction decides which side is source vs. destination; the host
     side is always the lazy memory object. Callers must ensure every object is
@@ -116,36 +113,33 @@ def build_staging_copies(
 
     Args:
         memory_objs: Lazy-allocator memory objects, one per chunk in the batch.
-        gpu_buffers: GPU staging buffers, aligned element-wise with
-            ``memory_objs``.
+        gpu_slots: Pre-resolved (device pointer, byte size) staging slots,
+            aligned element-wise with ``memory_objs``. The caller must keep
+            their backing GPU allocation alive through transfer completion.
         is_h2d: True for retrieve (CPU->GPU), False for store (GPU->CPU).
-        as_tuples: Emit plain (destination, source, bytes, host_offset) tuples
-            for bulk native conversion instead of individual pybind objects.
 
     Returns:
-        One descriptor or four-integer tuple per object, in input order.
+        One (destination, source, bytes, host_offset) tuple per object, in order.
 
     Raises:
         ValueError: If an object has not been allocated (``raw_tensor`` is None)
             or its size does not match its GPU buffer.
     """
-    copies: list[StagingCopy | tuple[int, int, int, int]] = []
-    for memory_obj, gpu_buffer in zip(memory_objs, gpu_buffers, strict=True):
+    copies: list[tuple[int, int, int, int]] = []
+    for memory_obj, (gpu_ptr, gpu_size) in zip(memory_objs, gpu_slots, strict=True):
         if memory_obj.raw_tensor is None:
             raise ValueError(
                 "memory_obj.raw_tensor is None; ensure the MemoryObj has been "
                 "allocated."
             )
         mem_obj_size = memory_obj.get_size()
-        if mem_obj_size != gpu_buffer.nbytes:
+        if mem_obj_size != gpu_size:
             raise ValueError(
                 f"Size mismatch: memory_obj nbytes={mem_obj_size}, "
-                f"gpu_buffer nbytes={gpu_buffer.nbytes}"
+                f"gpu_buffer nbytes={gpu_size}"
             )
         host_ptr = memory_obj.data_ptr
-        gpu_ptr = gpu_buffer.data_ptr()
         host_offset = memory_obj.meta.address
         dest, src = (gpu_ptr, host_ptr) if is_h2d else (host_ptr, gpu_ptr)
-        args = (dest, src, mem_obj_size, host_offset)
-        copies.append(args if as_tuples else device_ops.StagingCopy(*args))
+        copies.append((dest, src, mem_obj_size, host_offset))
     return copies

@@ -26,6 +26,17 @@ staging copy's line rate, so the kernel dominates the transfer.
 | Layouts | all `EngineKVFormat`s | token-major, contiguous block: formats 0, 1, 2, 3, 4, 5, 9, 11, 13 |
 | Requirements | any CUDA / HIP | CUDA runtime and driver >= 12.8, or ROCm/HIP >= 7.15 (opt-in) |
 
+Staged native plans use `execute_object_group_transfer_tuples` when available:
+`[(copies, launches), ...]`, where each copy is
+`(dest, src, nbytes, host_offset)` and each launch is
+`(group_idx, block_ids_offset, total_blocks, num_objects, skip_prefix_n_blocks)`.
+The binding converts the complete plan to existing `BatchStep` descriptors
+once, then calls the original executor. Batch boundaries preserve staging-slot
+reuse and H2D/D2H ordering. Pybind checks tuple arity and integer widths before
+submission; executor validation remains unchanged. Older extensions receive
+the original descriptor list. GPU slot addresses/sizes are resolved once per
+plan; source allocation validity, size and pointers are checked per object.
+
 On ROCm the direct path is **opt-in**: it is built when HIP >= 7.15 but stays
 disabled at runtime unless `LMCACHE_ROCM_ENABLE_BATCH_MEMCPY` is set to a
 non-zero value. The compile-time `HIP_VERSION` guard cannot prove the op is
