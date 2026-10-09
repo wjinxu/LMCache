@@ -512,7 +512,12 @@ def _ensure_transport_scheme(server_url: str) -> str:
         return server_url
     return f"tcp://{server_url}"
 
-
+# LMCache MP 连接器
+# MP 指的是 LMcache 在独立的进程中运行， vLLM 通过 connector调用他
+# vLLM scheduler 里的 connector → 查询 LMCache 缓存情况
+# vLLM GPU worker 里的 connector → 执行 KV retrieve / store
+#                                       ↓
+#                                 独立 LMCache server
 class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     """
     The connector for LMCache multi-process mode.
@@ -540,9 +545,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
     def __init__(
         self,
-        vllm_config: "VllmConfig",
-        role: KVConnectorRole,
-        kv_cache_config: "KVCacheConfig | None" = None,
+        vllm_config: "VllmConfig", # 并行方式
+        role: KVConnectorRole, # 当前实例在 scheduler 进程 还是 GPU worker 进程
+        kv_cache_config: "KVCacheConfig | None" = None, # vLLM 的 KV cache group、 block等布局
     ) -> None:
         """Initialize a worker or scheduler connector from vLLM configuration.
 
@@ -690,7 +695,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.lazy_offload requires vLLM prefix caching "
                 "(enable_prefix_caching=True)"
             )
-
+        # 角色分支 ： Scheduler 分支用来负责决定和记账
+        # 对应 vLLM 中的 Scheduler
         if self.role == KVConnectorRole.SCHEDULER:
             # Banner from the scheduler role only, so tensor-parallel
             # deployments print it once rather than once per worker.
@@ -717,6 +723,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
             # GPU block pool reference
             self._gpu_block_pool: "BlockPool | None" = None
+        # Worker 分支用来处理实际的 KV操作， 每个 GPU worker 创建自己的 adapter 连接对应的 LMCache server 提交
+        # retrieve/store 并跟踪完成服务
+        # 对应 vLLM 中的Worker
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
             # Global ranks are assigned to nodes in contiguous blocks:
@@ -873,7 +882,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             The number of elements in kv_caches and layer_names should be
             the same.
 
-        """
+        """ # 拿到 scheduler 传来的 metadata
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
 
@@ -882,7 +891,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         cache_salts = []
         request_configs_list = []
 
-        for meta in metadata.requests:
+        for meta in metadata.requests: # 只处理 retrieve
             if meta.direction != "RETRIEVE":
                 continue
             request_ids.append(meta.request_id)
@@ -892,7 +901,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         if len(request_ids) == 0:
             return
-
+        # 记录 event，然后提交
         event = self.worker_adapter.create_recorded_event()
 
         self.worker_adapter.batched_submit_retrieve_requests(
@@ -1151,11 +1160,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             self._gpu_block_pool = gpu_block_pool
             if self.lazy_offload:
                 self._lazy_offload_manager.bind_block_pool(gpu_block_pool)
-
+    # LMcache能提供多少额外的 tokens 的KV
     def get_num_new_matched_tokens(
         self,
         request: "Request",
-        num_computed_tokens: int,
+        num_computed_tokens: int, # 表示vLLM本地已经有的有效KV的前缀长度
     ) -> tuple[int | None, bool]:
         """
         Get number of new tokens that can be loaded from the
@@ -1184,6 +1193,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connectivity issues or eviction), those tokens must not be taken
             into account.
         """
+        # 拿到 tracker
         tracker = self._get_or_create_request_tracker(request)
 
         # A failed asynchronous load is bypassed until vLLM admits the request
@@ -1219,7 +1229,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.num_lmcache_hit_tokens = 0
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
-
+        # 提交 lookup 请求
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
         self.scheduler_adapter.maybe_submit_lookup_request(
@@ -1229,9 +1239,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request_configs=tracker.request_configs,
             reserve_last_token=self._reserve_last_token_for_lookup,
         )
-
+        # 查询结果
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)
-        if ret is None:
+        if ret is None: # None
+        # vLLM 收到之后会停止调度这个请求然后等待下一次Lookup
             return None, True
         assert tracker.lookup_started_at is not None
         self._connector_stats.record_lookup(
@@ -1243,7 +1254,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # down to a boundary aligned for every engine group (a full-prompt
         # APC hit reports num_prompt_tokens - 1), so the retrieve-skip
         # range stays paged-chunk-aligned in all groups.
-        tracker.num_vllm_hit_tokens = (
+        tracker.num_vllm_hit_tokens = ( # 将查询信息记录到tracker里面，然后对齐到block边界
             num_computed_tokens
             // self._hit_alignment_tokens
             * self._hit_alignment_tokens
@@ -1253,7 +1264,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
-
+        # 设置 stored_tokens,因为LMcache已经存了这些前缀，后续store就可以从他们继续
         tracker.num_stored_tokens = ret
         tracker.num_lmcache_hit_tokens = ret
 
@@ -1267,7 +1278,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 ret,
                 need_to_load,
             )
-
+        # 如果完整命中，就需要留下一个token重新计算，因为需要做prefill
         # In full-prompt-hit case, we need to recompute the last token.
         # Without this, num_computed_tokens would equal request.num_tokens,
         # causing num_new_tokens to be 0 and triggering the
@@ -1278,7 +1289,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         logger.debug(
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
         )
-        return need_to_load, need_to_load > 0
+        return need_to_load, need_to_load > 0 # 返回额外加载多少和需要加载多少
 
     def on_new_request(self, request: "Request") -> None:
         """Submit an LMCache lookup when a request enters the waiting queue.
@@ -1286,17 +1297,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         Args:
             request (Request): The request object.
         """
-        if self.role != KVConnectorRole.SCHEDULER:
+        if self.role != KVConnectorRole.SCHEDULER: # 只有在 scheduler 里面才执行
             return
         if not self._eager_prefetch or request.resumable:
             return
-
+        # 创建一个 tracker 来追踪 request 的整个生命周期
         tracker = self._get_or_create_request_tracker(request)
+        # 用于统计用时
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
-            token_ids=tracker.get_token_ids(),
+            token_ids=tracker.get_token_ids(), # 给出缓存 key 使用的 token 序列
             cache_salt=tracker.cache_salt,
             request_configs=tracker.request_configs,
             reserve_last_token=self._reserve_last_token_for_lookup,
@@ -1764,7 +1776,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> LMCacheMPRequestTracker:
         request_id = request.request_id
         # Remove the old trackers that is created before the preemption
-        if (
+        if ( # 暂时跳过
             request.status == RequestStatus.PREEMPTED
             and request_id in self.request_trackers
         ):
@@ -1781,14 +1793,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     # The recreated tracker restarts at token zero, so its
                     # manager discards overlapping buffered metadata.
                     self._lazy_offload_manager.on_request_reset(request_id)
-
+        # 如果是一个新请求
         if request_id not in self.request_trackers:
             if self.lazy_offload:
                 actions = self._lazy_offload_manager.on_request_arrived(request_id)
                 for session_id in actions.sessions_to_end:
                     self.scheduler_adapter.end_session(session_id)
-            new_tracker = LMCacheMPRequestTracker(request)
-            self.request_trackers[request_id] = new_tracker
+            new_tracker = LMCacheMPRequestTracker(request) # 创建一个Tracker来追踪
+            self.request_trackers[request_id] = new_tracker # 放到账本里面
         return self.request_trackers[request_id]
 
     def _cleanup_request_tracker(self, request_id: str) -> None:

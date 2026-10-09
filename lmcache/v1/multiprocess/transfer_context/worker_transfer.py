@@ -683,7 +683,7 @@ class LMCacheDrivenTransferContext(TransferContext):
         key: Any,
         _kv_caches: dict[str, torch.Tensor],
         block_ids: list[list[int]],
-        event: IPCEvent | None,
+        event: IPCEvent | None, # 需要等待前面的时间完成，然后再开始当前的时间
         _blocks_in_chunk: int,
         skip_first_n_tokens: int = 0,
     ) -> MessagingFuture:
@@ -713,8 +713,8 @@ class LMCacheDrivenTransferContext(TransferContext):
             )
         if event is None:
             raise RuntimeError("LMCache-driven transfer requires an IPC event.")
-        event_ipc_handle = self._event_backend.export_event(event, self._device)
-        return self._req_client.retrieve(
+        event_ipc_handle = self._event_backend.export_event(event, self._device) # 导出对应的 IPC_handle
+        return self._req_client.retrieve( # 将对应的事件发送给server
             key,
             self._instance_id,
             block_ids,

@@ -250,7 +250,7 @@ class DeviceMessagingFuture(MessagingFuture[T]):
 
         assert self.result_ is not None
         return self.result_
-
+    # 通过查询 event 看是否已经完成
     def query(self) -> bool:
         """
         Check if the future is done.

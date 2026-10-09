@@ -851,10 +851,10 @@ class LMCacheMPSchedulerAdapter:
         if not self.is_healthy:
             return
 
-        if request_id in self._pending_lookups:
+        if request_id in self._pending_lookups: # 因为一个请求可能被调度器反复查询，引起adapter要记住已经提交的 lookup
             # Skip if there is already a lookup request
             return
-
+        # 按照 chunk_size 大小对齐开始查询： 如果有600个tokens，chunk_size 为256 那这次查询覆盖前512个
         lookup_tokens = max(0, len(token_ids) - int(reserve_last_token))
         aligned_end = (
             lookup_tokens // self.lmcache_tokens_per_chunk
@@ -868,7 +868,7 @@ class LMCacheMPSchedulerAdapter:
             cache_salt=cache_salt,
             request_configs=request_configs,
         ).no_worker_id_version()
-
+        # 直接提交查询LOOKUP，保存futures，直接返回，由后面的check_look_result() 获取
         futures: dict[str, MessagingFuture[None]] = {
             url: self.req_clients[url].lookup(key, self.tp_size)
             for url in self._server_urls
@@ -1809,7 +1809,7 @@ class LMCacheMPWorkerAdapter:
                 self._build_store_kv_events(key)
             )
 
-    @_lmcache_nvtx_annotate
+    @_lmcache_nvtx_annotate # 提交一个 retrieve_request
     def submit_retrieve_request(
         self,
         request_id: str,
@@ -1842,6 +1842,7 @@ class LMCacheMPWorkerAdapter:
             return
 
         assert op.token_ids is not None
+        # 根据 token 的范围，找到对应的缓存位置
         key = self._create_key(
             op.token_ids,
             op.start,
@@ -1855,6 +1856,7 @@ class LMCacheMPWorkerAdapter:
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting retrieve requests."
             )
+        # 提交 retrieve 事件
         future = self.transfer_ctx.submit_retrieve(
             request_id,
             key,
@@ -1917,7 +1919,7 @@ class LMCacheMPWorkerAdapter:
                 request_configs=request_configs,
             )
 
-    @_lmcache_nvtx_annotate
+    @_lmcache_nvtx_annotate # 提交 retrieve event
     def batched_submit_retrieve_requests(
         self,
         request_ids: list[str],
@@ -1955,7 +1957,7 @@ class LMCacheMPWorkerAdapter:
                 "request_ids, ops, cache_salts, and request_configs_list "
                 "must have the same length"
             )
-        for request_id, op, salt, request_configs in zip(
+        for request_id, op, salt, request_configs in zip( # 接受一组任务，然后再逐个提交
             request_ids, ops, cache_salts, request_configs_list, strict=True
         ):
             self.submit_retrieve_request(
@@ -2069,10 +2071,10 @@ class LMCacheMPWorkerAdapter:
             else:
                 self._publish_store_kv_events(request_id)
 
-        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items():
-            if not r_future.query():
+        for request_id, (r_future, r_block_ids) in self.retrieve_futures.items(): # 提交时候保留的信息
+            if not r_future.query(): # 如果查询还没到就conitnue，下次再查询
                 continue
-
+            # 否则，操作已经结束，可以取结果了
             r_result = r_future.result(timeout=60)
             finished_retrieves.add(request_id)
 
@@ -2084,7 +2086,7 @@ class LMCacheMPWorkerAdapter:
                     request_id,
                     r_result,
                 )
-
+        # 取到相应的结果
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)

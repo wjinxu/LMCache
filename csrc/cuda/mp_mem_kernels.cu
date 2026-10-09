@@ -785,12 +785,12 @@ void execute_direct_copy_transfer(
   const bool is_h2d = (direction == TransferDirection::H2D);
 
   // --- Per-group addressing, resolved once ---
-  std::vector<BlockAddressing> addressing(group_specs.size());
-  std::vector<int> blocks_per_chunk(group_specs.size());
-  std::vector<size_t> layer_bytes(group_specs.size());
+  std::vector<BlockAddressing> addressing(group_specs.size()); // GPU 内存的地址计算规则
+  std::vector<int> blocks_per_chunk(group_specs.size()); // 一个 chunk 对应多少 KV block
+  std::vector<size_t> layer_bytes(group_specs.size()); // 一个 chunk 中 单层 K/V 分离占多少字节
   for (size_t g = 0; g < group_specs.size(); ++g) {
     const DirectCopyGroupSpec& spec = group_specs[g];
-    const PageBufferShapeDesc& sd = spec.shape_desc;
+    const PageBufferShapeDesc& sd = spec.shape_desc; // 拿到描述
     TORCH_CHECK(
         resolve_block_addressing(spec.engine_kv_format, sd, addressing[g]),
         "EngineKVFormat ", static_cast<int>(spec.engine_kv_format),

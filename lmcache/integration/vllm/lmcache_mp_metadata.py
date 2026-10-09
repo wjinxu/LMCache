@@ -41,7 +41,7 @@ class LMCacheMPRequestState(enum.Enum):
     READY = enum.auto()
     BYPASS_LMCACHE = enum.auto()
 
-
+# RequestTracker 元数据：用来表示一个 Request 的生命周期
 @dataclass
 class LMCacheMPRequestTracker:
     # NOTE: this class used vLLM data structures, should be part of
@@ -50,10 +50,12 @@ class LMCacheMPRequestTracker:
     request_id: str
 
     # Read-only list to track the token ids
+    # 这个请求要查询哪些 token 的缓存
     all_token_ids: ConstantList[int]
 
     # Block ids will be updated at update_states_after_alloc and
     # during generation. Keyed by engine_group_idx; non-HMA models use 0.
+    # retrieve/store 应该操作哪些 vLLM blocks
     allocated_block_ids: dict[int, list[int]] = field(default_factory=dict)
 
     # Number of scheduled tokens in this request. We keep tracking this to
@@ -66,10 +68,12 @@ class LMCacheMPRequestTracker:
     num_stored_tokens: int = 0
 
     # Staging load operation -- save vllm and lmcache hit tokens during lookup
+    # vLLM 和 lmcache 的命中多少token
     num_vllm_hit_tokens: int = 0
     num_lmcache_hit_tokens: int = 0
 
     # Main state
+    # 到了 LM cache操作的哪个阶段？
     state: LMCacheMPRequestState = LMCacheMPRequestState.PREFETCHING
 
     cache_salt: str = ""

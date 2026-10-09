@@ -451,12 +451,20 @@ def _run_object_group_transfer_plan(
         **timing_kwargs,
     )
 
+# memory_objs：
+#     [chunk 0, chunk 1]             共 512 tokens
+
+# block_ids_host：
+#     [[32 个 block IDs]]            每个 chunk 对应 16 个 blocks
+# group -> 哪些层的 KV 放在一起
+# chunk ： 一种另外的切割方式
+# KV 层 -> 每 chunk 分成一个 MemoryObj
 
 def run_direct_transfer(
     cache_context: BaseCacheContext,
-    block_ids_host: Sequence[Sequence[int]],
-    memory_objs: Sequence[MemoryObj | None],
-    object_group_id: int,
+    block_ids_host: Sequence[Sequence[int]], # 要写入哪些 GPU blocks
+    memory_objs: Sequence[MemoryObj | None], # CPU 上的缓存 chunks
+    object_group_id: int, # 选定哪一个group
     skip_first_n_tokens: int,
     direction: "lmcache_native.TransferDirection",
 ) -> None:
@@ -487,19 +495,22 @@ def run_direct_transfer(
         ValueError: If a None entry is found in memory_objs when direction is
             H2D, or if an object has not been allocated.
     """
-    lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
+    # object_group ： 区分层区别(such as full attention、linear attention)
+    # KV_group 代表着可以交给一次搬运 kernel 调用的层  相同层内区别 (such as diff num_head)
+    lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk # KV cache 信息
     kv_groups_manager = cache_context.kv_layer_groups_manager
     object_group = kv_groups_manager.object_groups[object_group_id]
-    kernel_group_ids = object_group.kernel_group_indices
-    is_h2d = direction == lmcache_native.TransferDirection.H2D
+    kernel_group_ids = object_group.kernel_group_indices # 这个 object group 有哪些 kernel group
+    is_h2d = direction == lmcache_native.TransferDirection.H2D # 传输的方向(such as h2d)
 
     group_specs: list[Any] = []
     blocks_per_chunk_by_kg: list[int] = []
     blocks_per_window_by_kg: list[int] = []
-    for kernel_group_id in kernel_group_ids:
-        blocks_per_chunk = cache_context.calculate_num_blocks(
+    for kernel_group_id in kernel_group_ids: # 遍历所有的 kenrel group
+        blocks_per_chunk = cache_context.calculate_num_blocks( # 计算 blocks 和 chunks 的比值
             lmcache_chunk_size, kernel_group_id
         )
+        # 滑动窗口(如果是滑动窗口下 窗口就是 get_subchunk_sw_size_tokens 否则就是完整的chunk_size)
         tokens_per_window = min(
             lmcache_chunk_size,
             kv_groups_manager.get_subchunk_sw_size_tokens(kernel_group_id),
@@ -509,6 +520,7 @@ def run_direct_transfer(
         )
         blocks_per_chunk_by_kg.append(blocks_per_chunk)
         blocks_per_window_by_kg.append(blocks_per_window)
+        # 核心操作 ： 创建 DirectCopyGroupSpec 打包 计算地址所有的信息
         group_specs.append(
             device_ops.DirectCopyGroupSpec(
                 cache_context.get_kernel_group_kv_pointer_list(kernel_group_id),
@@ -521,7 +533,7 @@ def run_direct_transfer(
                 list(block_ids_host[kernel_group_id]),
             )
         )
-
+    # 滑动窗口
     attn_desc = kv_groups_manager.get_attn_desc()
     num_objects_to_skip = 0
     if not attn_desc.is_full_attention(object_group_id) and is_h2d:
@@ -529,7 +541,7 @@ def run_direct_transfer(
         num_objects_to_skip = max(0, len(memory_objs) - sw_size_chunks)
 
     objects: list[Any] = []
-    for chunk_idx in range(num_objects_to_skip, len(memory_objs)):
+    for chunk_idx in range(num_objects_to_skip, len(memory_objs)): # 遍历 Memory_obj
         memory_obj = memory_objs[chunk_idx]
         if memory_obj is None:
             if is_h2d:
@@ -542,6 +554,7 @@ def run_direct_transfer(
                 "memory_obj.raw_tensor is None; ensure the MemoryObj has been "
                 "allocated."
             )
+        # 跳过 vLLM 已经有的KV前缀
         chunk_start_token = chunk_idx * lmcache_chunk_size
         chunk_end_token = chunk_start_token + lmcache_chunk_size
         effective_start = max(chunk_start_token, skip_first_n_tokens)
@@ -573,7 +586,7 @@ def run_direct_transfer(
 
     if not objects:
         return
-
+    # 交给 native 层
     device_ops.execute_direct_copy_transfer(
         direction,
         cache_context.device,
