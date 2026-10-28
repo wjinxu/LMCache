@@ -97,6 +97,8 @@ _L1_WRITE_TAG = "storage_manager"
 
 # Internal stream-callback payload. No MemoryObj or device pointer crosses msgpack.
 L1WriteCompletion = list[tuple[int, list[ObjectKey]]]
+# Active-read callbacks carry acquisition identities rather than reusable keys.
+L1ReadCompletion = list[tuple[int, list[int]]]
 
 
 class StorageManager:
@@ -759,6 +761,76 @@ class StorageManager:
             good_keys.append(key)
             good_objs.append(obj)
         return good_keys, good_objs
+
+    def acquire_read(
+        self,
+        keys: list[ObjectKey],
+        l1_owners: dict[ObjectKey, int] | None = None,
+    ) -> tuple[list[ObjectKey], list[MemoryObj], L1ReadCompletion]:
+        """Protect prefetched objects until an explicit transfer completion.
+
+        Args:
+            keys: Keys whose prefetch reservations the caller owns.
+            l1_owners: Exact owners retained by prefetch; required for multi-L1.
+
+        Returns:
+            Successful keys, their objects in request order, and an owner/handle
+            payload for ``finish_active_reads``. Partial success is possible;
+            the caller must release every returned handle even on a miss.
+
+        Raises:
+            ValueError: Owners are absent for multiple L1s or unregistered.
+        """
+        groups = self._read_groups(keys, l1_owners)
+        objects: dict[ObjectKey, MemoryObj] = {}
+        completion: L1ReadCompletion = []
+        acquired = False
+        try:
+            for owner, group in groups.items():
+                results = self._l1_managers_by_id[owner].acquire_read(group)
+                handles: list[int] = []
+                completion.append((owner, handles))
+                for key, (error, read) in results.items():
+                    if error == L1Error.SUCCESS and read is not None:
+                        handles.append(read.handle)
+                        objects[key] = read.memory_obj
+            good_keys = [key for key in dict.fromkeys(keys) if key in objects]
+            acquired = True
+            return good_keys, [objects[key] for key in good_keys], completion
+        finally:
+            if not acquired:
+                self.finish_active_reads(completion)
+
+    def finish_active_reads(self, completion: L1ReadCompletion) -> None:
+        """Release exact transfer acquisitions after their last memory access.
+
+        Args:
+            completion: Owner/handle groups returned by ``acquire_read``;
+                serializable for a device stream callback. Replays are harmless.
+
+        Raises:
+            ValueError: A captured owner is no longer registered.
+        """
+        if any(owner not in self._l1_managers_by_id for owner, _ in completion):
+            raise ValueError("Active read completion requires a registered L1 owner")
+        completed: list[ObjectKey] = []
+        for owner, handles in completion:
+            completed.extend(
+                self._l1_managers_by_id[owner].finish_active_reads(handles)
+            )
+        # Replay uses key-based reservations and cannot reuse process-local handles.
+        if completed:
+            publish_call_event(
+                "lmcache.v1.distributed.storage_manager."
+                "StorageManager.finish_read_prefetched",
+                {"keys": completed, "read_locks": 1},
+            )
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.SM_READ_PREFETCHED_FINISHED,
+                metadata={"succeeded_keys": completed, "failed_keys": []},
+            )
+        )
 
     @property
     def quota_manager(self) -> QuotaManager:

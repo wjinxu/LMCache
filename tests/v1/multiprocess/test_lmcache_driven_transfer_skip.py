@@ -170,11 +170,13 @@ def _make_module(monkeypatch, num_chunks, num_chunks_in_sw, group_kinds=()):
 
     def fake_read(keys, l1_owners=None):
         read_calls.append(list(keys))
-        return list(keys), [
-            MagicMock(get_size=MagicMock(return_value=10)) for _ in keys
-        ]
+        return (
+            list(keys),
+            [MagicMock(get_size=MagicMock(return_value=10)) for _ in keys],
+            [(10, list(range(len(keys))))],
+        )
 
-    ctx.storage_manager.unsafe_read = MagicMock(side_effect=fake_read)
+    ctx.storage_manager.acquire_read = MagicMock(side_effect=fake_read)
     module._ctx = ctx
 
     transfer_calls: list[tuple[int, list]] = []
@@ -271,8 +273,7 @@ def test_retrieve_reads_and_transfers_only_in_window(monkeypatch):
     assert ok is True
 
     # Full-attention group reads all 5 keys; mamba group reads only the last.
-    assert read_calls[0] == [f"g0c{c}" for c in range(5)]
-    assert read_calls[1] == ["g1c4"]
+    assert read_calls == [[*[f"g0c{c}" for c in range(5)], "g1c4"]]
 
     # memory_objs handed to the transfer stay full-length; the mamba group's
     # skipped prefix is None-padded (skip = num_chunks - window = 4).
@@ -327,18 +328,20 @@ def test_retrieve_never_reads_aux_groups(monkeypatch):
 
     # Recurrent group reads its one-block window; attention reads everything;
     # the aux group is read by NOBODY and transferred by nobody.
-    assert read_calls == [["g0c2"], [f"g1c{c}" for c in range(3)]]
+    assert read_calls == [["g0c2", *[f"g1c{c}" for c in range(3)]]]
     assert [g for g, _ in transfer_calls] == [0, 1]
 
 
-def test_failed_copy_releases_all_retained_owners_on_stream(monkeypatch):
+def test_failed_copy_releases_all_retained_owners_on_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Queued work and unvisited groups retain their buffers until the callback."""
     module, reads, _ = _make_module(monkeypatch, 2, [-1, 1])
     cache_context = module.get_and_touch_context_entry(1).cache_context
     cache_context.hold_imported_event.return_value = 7
     owners = {"g0c0": 10, "g0c1": 10, "g1c1": 20}
-    completion = [(10, ["g0c0", "g0c1"]), (20, ["g1c1"])]
+    completion = [(10, [0, 1, 2])]
     module.context.get_read_owners.return_value = owners
-    module.context.storage_manager.prepare_read_completion.return_value = completion
     callback = MagicMock()
     monkeypatch.setattr(mod, "submit_callback_to_stream", callback)
     cache_context.transfer_object_group.side_effect = RuntimeError(
@@ -351,15 +354,43 @@ def test_failed_copy_releases_all_retained_owners_on_stream(monkeypatch):
         b"producer",
     )
     assert not ok
-    assert reads == [["g0c0", "g0c1"]]
-    module.context.storage_manager.prepare_read_completion.assert_called_once_with(
-        ["g0c0", "g0c1", "g1c1"], owners
+    assert reads == [["g0c0", "g0c1", "g1c1"]]
+    module.context.storage_manager.acquire_read.assert_called_once_with(
+        ["g0c0", "g0c1", "g1c1"], l1_owners=owners
     )
     assert callback.call_args_list == [
         call(cache_context.cupy_stream, "release_imported_event", (1, 7)),
-        call(cache_context.cupy_stream, "finish_read_by_owner", completion),
+        call(cache_context.cupy_stream, "finish_active_reads", completion),
     ]
     module.context.storage_manager.finish_read_prefetched.assert_not_called()
+
+
+def test_partial_acquisition_skips_copy_and_releases_successes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One expired reservation fails retrieve while acquired peers finish."""
+    module, _, transfers = _make_module(monkeypatch, 2, [-1])
+    cache_context = module.get_and_touch_context_entry(1).cache_context
+    completion = [(10, [3])]
+    module.context.storage_manager.acquire_read.side_effect = None
+    module.context.storage_manager.acquire_read.return_value = (
+        ["g0c0"],
+        [MagicMock()],
+        completion,
+    )
+    callback = MagicMock()
+    monkeypatch.setattr(mod, "submit_callback_to_stream", callback)
+    _, ok = module.retrieve(
+        SimpleNamespace(request_id="req", cache_salt="salt"),
+        1,
+        [[1, 2]],
+        b"producer",
+    )
+    assert not ok and not transfers
+    assert callback.call_args_list[-1] == call(
+        cache_context.cupy_stream, "finish_active_reads", completion
+    )
+    module.context.storage_manager.finish_active_reads.assert_not_called()
 
 
 # ------------------------------------------------------------------ #

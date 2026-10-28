@@ -14,6 +14,9 @@ import pytest
 import torch
 
 # First Party
+from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.storage_manager import L1ReadCompletion
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.multiprocess.futures import DeviceMessagingFuture, MessagingFuture
 
 
@@ -93,11 +96,15 @@ class _FakeStorageManager:
     ) -> dict[object, object]:
         return {}
 
-    def prepare_read_completion(self, keys, l1_owners=None):
-        return []
+    def finish_active_reads(self, completion: L1ReadCompletion) -> None:
+        """Accept the active acquisition callback registered by the module."""
+        return None
 
-    def unsafe_read(self, keys, l1_owners=None):
-        return [], []
+    def acquire_read(
+        self, keys: list[ObjectKey], l1_owners: dict[ObjectKey, int] | None = None
+    ) -> tuple[list[ObjectKey], list[MemoryObj], L1ReadCompletion]:
+        """Return no acquisitions for the empty request in this test."""
+        return [], [], []
 
 
 def _resolved_future(result: object) -> MessagingFuture[object]:

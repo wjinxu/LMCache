@@ -24,6 +24,7 @@ from lmcache.v1.distributed.api import (
 from lmcache.v1.distributed.config import L1ManagerConfig, get_configured_capacity_bytes
 from lmcache.v1.distributed.error import L1Error, L1ReconfigureError
 from lmcache.v1.distributed.internal_api import (
+    L1ActiveRead,
     L1ManagerInterface,
     L1ManagerListener,
     L1ObjectMeta,
@@ -111,6 +112,9 @@ class L1ObjectState:
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
+
+    active_reads: int = 0
+    """Acquisitions that prevent normal reclamation, independent of the TTL."""
 
 
 def l1_mgr_synchronized(func):
@@ -210,6 +214,8 @@ class L1Manager(L1ManagerInterface):
 
         # Resident objects: readable, never write-locked.
         self._objects: dict[ObjectKey, L1ObjectState] = {}
+        self._active_reads: dict[int, tuple[ObjectKey, L1ObjectState]] = {}
+        self._read_handles = count()
         # Staging objects: key -> writer tag -> write-locked object that is
         # invisible to readers until it is admitted by finish_write.
         self._staging: dict[ObjectKey, dict[str, L1ObjectState]] = {}
@@ -380,6 +386,85 @@ class L1Manager(L1ManagerInterface):
         return ret
 
     @l1_mgr_synchronized
+    def acquire_read(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, tuple[L1Error, L1ActiveRead | None]]:
+        """Convert one live TTL reservation per key into a non-expiring read.
+
+        Validation, reservation consumption and allocation protection are
+        atomic with respect to eviction. A successful acquisition must be
+        released with ``finish_active_reads``, never ``finish_read``.
+
+        Args:
+            keys: Keys whose prefetch reservations the caller owns.
+
+        Returns:
+            Per-key status and an active read on success. Missing objects
+            return KEY_NOT_EXIST; expired or consumed reservations return
+            KEY_NOT_READABLE. Partial success is possible.
+        """
+        results: dict[ObjectKey, tuple[L1Error, L1ActiveRead | None]] = {}
+        for key in dict.fromkeys(keys):
+            entry = self._objects.get(key)
+            if entry is None:
+                results[key] = (L1Error.KEY_NOT_EXIST, None)
+            elif not entry.read_lock.is_locked():
+                results[key] = (L1Error.KEY_NOT_READABLE, None)
+            else:
+                handle = next(self._read_handles)
+                entry.active_reads += 1
+                entry.read_lock.unlock()
+                self._active_reads[handle] = (key, entry)
+                results[key] = (L1Error.SUCCESS, L1ActiveRead(handle, entry.memory_obj))
+        return results
+
+    @l1_mgr_synchronized
+    def finish_active_reads(self, handles: list[int]) -> list[ObjectKey]:
+        """Release completed reads without touching newer TTL reservations.
+
+        Args:
+            handles: Identities returned by this manager's ``acquire_read``.
+                Release only after all synchronous or asynchronous use ends.
+
+        Returns:
+            Keys completed by this call. Repeated handles are ignored;
+            handles detached by forced deletion cannot affect a replacement.
+        """
+        completed: list[ObjectKey] = []
+        freed_keys: list[ObjectKey] = []
+        freed_objs: list[MemoryObj] = []
+        for handle in handles:
+            acquired = self._active_reads.pop(handle, None)
+            if acquired is None:
+                continue
+            key, entry = acquired
+            entry.active_reads -= 1
+            if self._objects.get(key) is not entry:
+                continue
+            completed.append(key)
+            if (
+                entry.is_temporary
+                and not entry.active_reads
+                and not entry.read_lock.is_locked()
+            ):
+                del self._objects[key]
+                freed_keys.append(key)
+                freed_objs.append(entry.memory_obj)
+        if not completed:
+            return completed
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_read_finished(completed)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_READ_FINISHED,
+                metadata={"l1_tag": self._config.tag, "keys": completed},
+            )
+        )
+        if freed_keys:
+            self._free_and_report_deleted(freed_keys, freed_objs)
+        return completed
+
+    @l1_mgr_synchronized
     def finish_read(
         self,
         keys: list[ObjectKey],
@@ -387,8 +472,8 @@ class L1Manager(L1ManagerInterface):
     ) -> dict[ObjectKey, L1Error]:
         """Finish read access for the given keys.
 
-        Will delete the object if it is temporary and read
-        count reaches zero.
+        Delete a temporary object when no TTL reservation or active read
+        remains. Active acquisitions must use ``finish_active_reads``.
 
         Args:
             keys: The list of object keys to finish read
@@ -439,7 +524,11 @@ class L1Manager(L1ManagerInterface):
             # overhead (TTLLock is C++ std::atomic).
             for _ in range(total):
                 entry.read_lock.unlock()
-            if entry.is_temporary and not entry.read_lock.is_locked():
+            if (
+                entry.is_temporary
+                and not entry.active_reads
+                and not entry.read_lock.is_locked()
+            ):
                 need_to_free.append(entry.memory_obj)
                 need_to_free_keys.append(key)
                 del self._objects[key]
@@ -755,8 +844,8 @@ class L1Manager(L1ManagerInterface):
     ) -> dict[ObjectKey, L1Error]:
         """Delete the given keys from L1 cache.
 
-        Deletes the resident object and reclaims the key's staging objects
-        whose write lock expired (all of them when ``force`` is True).
+        Deletes an unprotected resident object and reclaims the key's staging
+        objects whose write lock expired (all of them when ``force`` is True).
 
         Args:
             keys: The list of object keys to delete.
@@ -770,9 +859,9 @@ class L1Manager(L1ManagerInterface):
 
         Errors:
             KEY_NOT_EXIST: The key does not exist.
-            KEY_IS_LOCKED: The key is read-locked, or a live staging object
-                exists for it, so it cannot be deleted. Never returned when
-                ``force`` is True.
+            KEY_IS_LOCKED: The key has a TTL reservation, an active read, or
+                a live staging object, so it cannot be deleted. Never returned
+                when ``force`` is True.
         """
         need_to_free: list[MemoryObj] = []
         ret: dict[ObjectKey, L1Error] = {}
@@ -796,7 +885,7 @@ class L1Manager(L1ManagerInterface):
                 gone_keys.append(key)
                 continue
 
-            locked = entry.read_lock.is_locked()
+            locked = entry.active_reads > 0 or entry.read_lock.is_locked()
             if locked and not force:
                 ret[key] = L1Error.KEY_IS_LOCKED
                 continue
@@ -883,9 +972,8 @@ class L1Manager(L1ManagerInterface):
             force: If True, clear ALL objects including read-locked ones and
                 every staging object. This may corrupt in-flight
                 store/prefetch operations. If False (default), only clear
-                unlocked resident objects and staging objects whose write
-                lock expired, keeping read-locked objects and live staging
-                objects intact.
+                resident objects without TTL reservations or active reads and
+                staging objects whose write lock expired.
         """
         if force:
             staging_count = sum(len(per_tag) for per_tag in self._staging.values())
@@ -930,7 +1018,7 @@ class L1Manager(L1ManagerInterface):
         locked_count = 0
 
         for key, entry in list(self._objects.items()):
-            if entry.read_lock.is_locked():
+            if entry.active_reads or entry.read_lock.is_locked():
                 locked_count += 1
                 continue
             keys_to_clear.append(key)
@@ -972,10 +1060,12 @@ class L1Manager(L1ManagerInterface):
             key: The object key to check.
 
         Returns:
-            True if the key has a resident object that is not read-locked,
-            or a staging object whose write lock expired; False otherwise.
+            False while the resident object has active reads. Otherwise True
+            for an unreserved resident or expired staging object.
         """
         entry = self._objects.get(key, None)
+        if entry is not None and entry.active_reads:
+            return False
         if entry is not None and not entry.read_lock.is_locked():
             return True
         per_tag = self._staging.get(key, None)
@@ -1191,6 +1281,7 @@ class L1Manager(L1ManagerInterface):
             self._memory_manager.free(all_memory_objs)
             self._objects.clear()
             self._staging.clear()
+            self._active_reads.clear()
             self._staging_bytes = 0
 
         self._memory_manager.close()
@@ -1205,11 +1296,12 @@ class L1Manager(L1ManagerInterface):
         ``total_object_count`` covers resident and staging objects;
         ``staging_object_count`` / ``staging_bytes`` report the staging
         subset and ``write_locked_count`` the live reservations among them.
+        ``read_locked_count`` includes resident objects held by active reads.
         """
         read_locked = 0
         temporary = 0
         for entry in self._objects.values():
-            if entry.read_lock.is_locked():
+            if entry.active_reads or entry.read_lock.is_locked():
                 read_locked += 1
             if entry.is_temporary:
                 temporary += 1
@@ -1268,7 +1360,9 @@ class L1Manager(L1ManagerInterface):
 
         # Log the locked objects for debugging
         num_read_locked = sum(
-            1 for entry in self._objects.values() if entry.read_lock.is_locked()
+            1
+            for entry in self._objects.values()
+            if entry.active_reads or entry.read_lock.is_locked()
         )
         num_staging = sum(len(per_tag) for per_tag in self._staging.values())
 

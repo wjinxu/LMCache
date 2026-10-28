@@ -36,6 +36,14 @@ L1EvictionController, SerdeL2AdapterWrapper
 L1Manager                 another implementation
 ```
 
+## Active read lifetime
+
+`acquire_read` converts a live TTL reservation to a non-expiring acquisition;
+`finish_active_reads` releases its unique handle after the final memory access.
+Implementations must make acquisition atomic with normal eviction and prevent
+temporary cleanup while an active read remains. See
+[active read lifetime](active_reads.md) for the completion and failure contracts.
+
 ## Tests
 
 `tests/v1/distributed/test_l1_interface.py` runs the contract against

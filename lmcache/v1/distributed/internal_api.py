@@ -31,6 +31,19 @@ L1OperationResult = tuple[L1Error, "MemoryObj | None"]
 
 
 @dataclass(frozen=True)
+class L1ActiveRead:
+    """One resident object protected until its handle is explicitly released.
+
+    Attributes:
+        handle: Manager-local identity of this acquisition, never reused.
+        memory_obj: Object whose allocation the handle protects.
+    """
+
+    handle: int
+    memory_obj: MemoryObj
+
+
+@dataclass(frozen=True)
 class L1MemoryDesc:
     """Describe the contiguous L1 memory arena exposed to external backends.
 
@@ -281,6 +294,25 @@ class L1ManagerInterface(Protocol):
 
     def unsafe_read(self, keys: list[ObjectKey]) -> dict[ObjectKey, L1OperationResult]:
         """Return already read-locked objects without new locks."""
+        ...
+
+    def acquire_read(
+        self, keys: list[ObjectKey]
+    ) -> dict[ObjectKey, tuple[L1Error, L1ActiveRead | None]]:
+        """Atomically convert one live reservation per key to an active read.
+
+        Each successful result owns one handle that must be released after
+        the last memory access. Missing or expired reservations return
+        KEY_NOT_EXIST or KEY_NOT_READABLE respectively.
+        """
+        ...
+
+    def finish_active_reads(self, handles: list[int]) -> list[ObjectKey]:
+        """Release exact acquisitions, returning keys completed by this call.
+
+        Duplicate or already released handles are ignored. No TTL reservation
+        is decremented. Forced deletion and shutdown remain destructive.
+        """
         ...
 
     def finish_read(

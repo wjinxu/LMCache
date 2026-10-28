@@ -23,7 +23,7 @@ from lmcache.v1.distributed.config import (
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.storage_controllers.write_policy import OrderedWritePolicy
-from lmcache.v1.distributed.storage_manager import StorageManager
+from lmcache.v1.distributed.storage_manager import L1ReadCompletion, StorageManager
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.trace import codecs
 from lmcache.v1.mp_observability.trace import decorator as trace_decorator
@@ -527,3 +527,98 @@ def test_delete_reports_a_key_as_skipped_while_any_copy_is_locked(
     assert store.delete_l1_keys(keys) == (0, 1)
     managers[locked_index].finish_read(keys)
     assert store.delete_l1_keys(keys) == (1, 0)
+
+
+def test_active_reads_capture_owners_and_roundtrip_completion(
+    storage_factory: StorageFactory,
+) -> None:
+    """The stream payload releases the selected copy across multiple L1s."""
+    store, managers, _ = storage_factory((4096, 4096))
+    owners = {}
+    for index, manager in enumerate(managers):
+        manager.reserve_write([key(index)], [False], LAYOUT)
+        manager.finish_write([key(index)])
+        manager.reserve_read([key(index)])
+        owners[key(index)] = manager.l1_manager_id
+    keys = [key(1), key(0)]
+    found, objects, completion = store.acquire_read(keys, owners)
+    assert found == keys
+    assert [obj.get_l1_manager() for obj in objects] == [owners[k] for k in keys]
+    assert store.delete_l1_keys(keys) == (0, 2)
+    payload = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(completion), type=L1ReadCompletion
+    )
+    store.finish_active_reads(payload)
+    # A repeated callback cannot consume a subsequent reservation.
+    for index, manager in enumerate(managers):
+        manager.reserve_read([key(index)])
+    store.finish_active_reads(payload)
+    assert store.delete_l1_keys(keys) == (0, 2)
+    store.finish_read_prefetched(keys, l1_owners=owners)
+    assert store.delete_l1_keys(keys) == (2, 0)
+
+
+def test_partial_active_acquisition_returns_releasable_handles(
+    storage_factory: StorageFactory,
+) -> None:
+    """A missing key does not hide successful acquisitions from cleanup."""
+    store, (manager,), _ = storage_factory((4096,))
+    manager.reserve_write([key(1)], [False], LAYOUT)
+    manager.finish_write([key(1)])
+    manager.reserve_read([key(1)])
+    found, objects, completion = store.acquire_read([key(0), key(1)])
+    assert found == [key(1)] and len(objects) == 1
+    store.finish_active_reads(completion)
+    assert manager.delete([key(1)])[key(1)] == L1Error.SUCCESS
+
+
+def test_active_acquisition_failure_releases_preceding_owners(
+    storage_factory: StorageFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later L1 failure rolls back active acquisitions already made."""
+    store, (primary, fallback), _ = storage_factory((4096, 4096))
+    primary.reserve_write([key(1)], [False], LAYOUT)
+    primary.finish_write([key(1)])
+    primary.reserve_read([key(1)])
+    owners = {key(1): primary.l1_manager_id, key(2): fallback.l1_manager_id}
+    monkeypatch.setattr(
+        fallback, "acquire_read", Mock(side_effect=RuntimeError("acquisition failed"))
+    )
+    with pytest.raises(RuntimeError, match="acquisition failed"):
+        store.acquire_read([key(1), key(2)], owners)
+    assert primary.delete([key(1)])[key(1)] == L1Error.SUCCESS
+
+
+def test_active_completion_trace_releases_replay_reservation(
+    storage_factory: StorageFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Active completion preserves storage traces without recording local IDs."""
+    source, (source_l1,), _ = storage_factory((4096,))
+    target, (target_l1,), _ = storage_factory((4096,))
+    keys = [key(1)]
+    for manager in (source_l1, target_l1):
+        manager.reserve_write(keys, [False], LAYOUT)
+        manager.finish_write(keys)
+        manager.reserve_read(keys)
+    _, _, completion = source.acquire_read(keys)
+    bus = Mock()
+    saved_gate = trace_decorator.is_tracing_enabled()
+    try:
+        monkeypatch.setattr(trace_decorator, "get_event_bus", lambda: bus)
+        trace_decorator.set_tracing_enabled(True)
+        source.finish_active_reads(completion)
+        source.finish_active_reads(completion)
+    finally:
+        trace_decorator.set_tracing_enabled(saved_gate)
+    bus.publish.assert_called_once()
+    event = bus.publish.call_args.args[0]
+    decoded = codecs.decode_args(
+        msgspec.msgpack.decode(
+            msgspec.msgpack.encode(codecs.encode_args(event.metadata["args"]))
+        )
+    )
+    assert decoded == {"keys": keys, "read_locks": 1}
+    build_default_dispatcher().dispatch(
+        event.metadata["qualname"], ReplayContext(target), decoded
+    )
+    assert target_l1.delete(keys)[keys[0]] == L1Error.SUCCESS
